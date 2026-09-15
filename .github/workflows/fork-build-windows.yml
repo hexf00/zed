@@ -35,7 +35,6 @@ jobs:
     timeout-minutes: 350
     env:
       CARGO_INCREMENTAL: "0"
-      RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       # Fork slimming (see docs/fork-maintenance.md): skip remote_server,
       # the largest non-editor product we never use. Requires the matching
@@ -57,6 +56,30 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache wrapper + canary
+        # RUSTC_WRAPPER as bare "sccache" silently failed to engage in two
+        # full cold builds (0 compile requests). Use the absolute path from
+        # the action, start the server explicitly, and prove the wrapper
+        # engages with a 1-second canary compile before burning hours.
+        shell: pwsh
+        run: |
+          "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
+          "SCCACHE_ERROR_LOG=$env:RUNNER_TEMP\sccache-error.log" >> $env:GITHUB_ENV
+          & $env:SCCACHE_PATH --stop-server 2>$null
+          & $env:SCCACHE_PATH --start-server
+          Write-Host "RUSTC_WRAPPER will be: $env:SCCACHE_PATH"
+          $dir = Join-Path $env:RUNNER_TEMP "wrapcanary"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Set-Content -Path (Join-Path $dir "canary.rs") -Value 'fn main() {}'
+          $env:RUSTC_WRAPPER = $env:SCCACHE_PATH
+          rustc (Join-Path $dir "canary.rs") -o (Join-Path $dir "canary.exe")
+          $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
+          Write-Host $stats
+          if ($stats -match "Compile requests\s+0") {
+            throw "sccache wrapper did not engage (canary compile bypassed it). RUSTC_WRAPPER='$env:RUSTC_WRAPPER'"
+          }
+          Write-Host "sccache wrapper canary OK"
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
@@ -100,8 +123,17 @@ jobs:
 
       - name: Show sccache stats
         shell: pwsh
-        run: sccache --show-stats
+        run: |
+          & $env:SCCACHE_PATH --show-stats
         if: always()
+
+      - name: Upload sccache error log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-error-log
+          path: ${{ runner.temp }}/sccache-error.log
+          if-no-files-found: ignore
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
