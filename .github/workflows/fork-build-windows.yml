@@ -56,17 +56,28 @@ jobs:
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
-        # ...\2022\Community path; hosted runners ship VS2022 Enterprise.
-        # A junction keeps the upstream script untouched (zero merge surface).
+        # ...\2022\Community path. Hosted runners ship VS2022 Enterprise,
+        # and may also carry an incomplete Community directory, so key off
+        # Launch-VsDevShell.ps1 itself and junction to whichever edition
+        # actually has it. This keeps the upstream script untouched.
         shell: pwsh
         run: |
           $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
-          if (-not (Test-Path "$vsRoot\Community") -and (Test-Path "$vsRoot\Enterprise")) {
-            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target "$vsRoot\Enterprise" | Out-Null
-            Write-Host "Created junction: Community -> Enterprise"
-          } else {
-            Write-Host "VS Community path already present, skipping junction"
+          $launch = "$vsRoot\Community\Common7\Tools\Launch-VsDevShell.ps1"
+          Get-ChildItem $vsRoot -Directory | ForEach-Object { Write-Host "VS edition dir: $($_.Name)" }
+          if (-not (Test-Path $launch)) {
+            $edition = Get-ChildItem $vsRoot -Directory |
+              Where-Object { Test-Path "$($_.FullName)\Common7\Tools\Launch-VsDevShell.ps1" } |
+              Select-Object -First 1
+            if (-not $edition) { throw "No VS edition with Launch-VsDevShell.ps1 under $vsRoot" }
+            if (Test-Path "$vsRoot\Community") {
+              Rename-Item "$vsRoot\Community" "Community.incomplete" -Force
+            }
+            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $edition.FullName | Out-Null
+            Write-Host "Junctioned Community -> $($edition.Name)"
           }
+          if (-not (Test-Path $launch)) { throw "Launch-VsDevShell.ps1 still missing after junction" }
+          Write-Host "Launch-VsDevShell.ps1 present"
 
       - name: Ensure Inno Setup 6
         # windows-latest images ship Inno Setup 6 at the path the bundle
