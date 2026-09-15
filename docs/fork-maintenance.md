@@ -92,6 +92,18 @@ fork 基础设施文件(`.github/workflows/fork-*.yml`、`docs/fork-maintenance.
 3. **默认设置**:`assets/settings/initial_user_settings.json` 追加键值。
 4. **核心功能**:最后手段,遵守 `fork:` 前缀 + 独立目录原则。
 
+## 当前 fork diff 清单
+
+fork 对上游源码的全部改动都必须登记在这里,同步上游时逐条复查。
+
+| 改动 | 文件 | 内容 | 恢复方式 |
+|------|------|------|----------|
+| SKIP-1 | `script/bundle-windows.ps1` | 跳过 remote_server 构建(fork 用不到 SSH 远程开发;它占上游冷构建约 40%)。由 `ZED_FORK_SKIP_REMOTE_SERVER=1` 环境变量门控,不设变量时行为与上游完全一致;同时 pdb 打包列表做了相应条件化 | workflow 里删掉该环境变量即可,脚本改动可无害保留 |
+
+上游同步时:该脚本若被上游修改,冲突处理原则是保留上游逻辑、重新套用
+`if ($env:ZED_FORK_SKIP_REMOTE_SERVER)` 门控。如果将来上游接受类似的
+opt-out 开关(PR 上游是更干净的终局),删除本地 diff。
+
 ## 已知取舍
 
 - 无代码签名:安装时 SmartScreen 会告警,自用可接受。
