@@ -14,7 +14,6 @@ on:
 permissions:
   contents: write
   issues: write
-  actions: write
 
 concurrency:
   group: fork-sync
@@ -80,11 +79,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "Upstream sync needs a manual merge ($(date -u +%F))" \
             --body "Weekly merge of main into custom hit conflicts. Run locally: git checkout custom && git fetch origin && git merge main. Resolve favoring upstream for untouched-by-you files, then push."
-
-      - name: Trigger Windows build on custom
-        if: steps.sync_custom.outputs.SYNCED == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run fork-build-windows.yml --ref custom --repo "${{ github.repository }}"
-          echo "Dispatched fork-build-windows on custom"
+        # No automatic build dispatch: builds are manual-only (hours long).
+        # Note GHA cache entries unused for 7 days get evicted - if you sync
+        # but never build, the next build falls back toward cold times.
+        # Trigger: gh workflow run fork-build-windows.yml --ref custom

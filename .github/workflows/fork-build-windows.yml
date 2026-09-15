@@ -13,10 +13,9 @@ on:
         options:
           - x86_64
           - aarch64
-  push:
-    branches: [custom]
-    paths-ignore:
-      - "**.md"
+  # Manual-only by design: cold/warm builds are hours long, so nothing
+  # triggers them implicitly. Public repos get free unlimited Actions
+  # minutes; the only cap is 6h per job (timeout below leaves headroom).
 
 permissions:
   contents: read
@@ -24,7 +23,8 @@ permissions:
 concurrency:
   group: fork-build-windows-${{ github.ref }}
   # Canceling is cheap with sccache: finished crate compilations are
-  # already persisted, only in-flight work is lost.
+  # already persisted, only in-flight work is lost. A newer manual run
+  # supersedes an older one on the same ref.
   cancel-in-progress: true
 
 jobs:

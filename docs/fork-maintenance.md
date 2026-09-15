@@ -32,11 +32,20 @@ fork 基础设施文件(`.github/workflows/fork-*.yml`、`docs/fork-maintenance.
 
 ### Fork Windows Build(`fork-build-windows.yml`)
 
-- 触发:手动 dispatch(可选 x86_64 / aarch64),或 push 到 `custom`(忽略纯文档改动)。
+- 触发:**仅手动 dispatch**(Actions 页面选 `custom` 分支点 Run workflow,或
+  `gh workflow run fork-build-windows.yml --ref custom`)。构建动辄数小时,
+  不做任何自动触发。
+- 费用与时长上限:本 fork 是**公开仓库**,GitHub Actions 免费、不限时长
+  (2000 分钟/月额度只对私有仓库生效);唯一硬限制是单 job 6 小时,
+  workflow 的 timeout 350 分钟留了余量。
 - 产物:未签名的 Windows 安装包 + zed-remote-server zip,在 run 的 Artifacts 里下载。
-- 缓存:sccache(GHA backend,上限约 10GB,LRU 逐出)+ cargo registry 缓存。
+- 缓存:sccache(GHA backend)+ cargo registry 缓存。两个规则要记住:
+  - GHA 缓存总量约 10GB,LRU 逐出;
+  - **7 天未被访问的缓存条目会被清除**——超过一周不构建,下次会向冷构建回落。
+  - 建议:至少每周(比如每次上游同步后)手动构建一次,让缓存保持热。
 - 时长预期(4 核托管 runner):
   - 首次冷构建:约 2.5–4 小时(上游 32 核冷构建约 31 分钟,核心数差 8 倍);
+    这次构建同时把 sccache 填满,是最慢的一次,也是唯一一次;
   - 之后暖缓存:约 30–60 分钟(只剩自研 crate 重编 + 链接 + 打包);
   - 签名/Inno Setup/打包约 5 分钟,缓存无法消除。
 - 已做的环境适配(不改上游脚本):
@@ -51,7 +60,8 @@ fork 基础设施文件(`.github/workflows/fork-*.yml`、`docs/fork-maintenance.
 
 - 每周一 09:30(北京时间)自动运行,也可手动触发。
 - 流程:fetch 上游 main → merge 进 `main` 并 push → merge `main` 进 `custom`
-  → 冲突时自动开 issue → 成功后自动 dispatch 一次 Windows 构建(顺便暖缓存)。
+  → 冲突时自动开 issue。**不会自动触发构建**(构建手动),同步完想出新包
+  就自己 dispatch 一次。
 - 注意:GitHub 仓库 60 天无活动会暂停 schedule workflow,长期不用时手动
   跑一次或 re-enable。
 
