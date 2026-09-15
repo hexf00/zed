@@ -86,5 +86,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh workflow run fork-build-windows.yml --ref custom
+          gh workflow run fork-build-windows.yml --ref custom --repo "${{ github.repository }}"
           echo "Dispatched fork-build-windows on custom"
