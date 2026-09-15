@@ -1,0 +1,90 @@
+# Fork-only workflow: keep the fork aligned with zed-industries/zed.
+#
+# Branch model (see docs/fork-maintenance.md):
+#   main   = upstream/main + fork infra commits (never hand-edit code here)
+#   custom = main + personal work; all custom code lives here
+name: Fork Upstream Sync
+
+on:
+  schedule:
+    # Mondays 01:30 UTC = 09:30 Beijing
+    - cron: "30 1 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch upstream main
+
+      - name: Merge upstream into main
+        run: |
+          git checkout main
+          if git merge --ff-only upstream/main 2>/dev/null; then
+            echo "Fast-forwarded main to upstream"
+          else
+            # main carries fork infra commits; upstream never touches them,
+            # so this merge resolves cleanly. A conflict here means fork
+            # infra files collided with upstream paths - fix manually.
+            git merge upstream/main -m "Merge upstream main into fork main ($(date -u +%F))"
+          fi
+          git push origin main
+
+      - name: Merge main into custom
+        id: sync_custom
+        continue-on-error: true
+        run: |
+          if ! git rev-parse --verify origin/custom >/dev/null 2>&1; then
+            echo "No custom branch yet, skipping"
+            exit 0
+          fi
+          git checkout custom
+          if git merge --ff-only main 2>/dev/null; then
+            echo "custom fast-forwarded to main"
+          else
+            git merge main -m "Merge upstream sync into custom ($(date -u +%F))"
+          fi
+          git push origin custom
+          echo "SYNCED=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open issue on custom merge conflict
+        if: steps.sync_custom.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git merge --abort 2>/dev/null || true
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Upstream sync needs a manual merge ($(date -u +%F))" \
+            --body "Weekly merge of main into custom hit conflicts. Run locally: git checkout custom && git fetch origin && git merge main. Resolve favoring upstream for untouched-by-you files, then push."
+
+      - name: Trigger Windows build on custom
+        if: steps.sync_custom.outputs.SYNCED == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run fork-build-windows.yml --ref custom
+          echo "Dispatched fork-build-windows on custom"

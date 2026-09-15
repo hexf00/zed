@@ -1,0 +1,103 @@
+# Fork-only workflow: build a personal Zed for Windows.
+# Upstream's release.yml is gated to zed-industries and left untouched;
+# this file is additive so upstream merges stay conflict-free.
+name: Fork Windows Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Target CPU architecture
+        type: choice
+        default: x86_64
+        options:
+          - x86_64
+          - aarch64
+  push:
+    branches: [custom]
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-build-windows-${{ github.ref }}
+  # Canceling is cheap with sccache: finished crate compilations are
+  # already persisted, only in-flight work is lost.
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # First run is a cold 4-core release build (expect 2.5-4h);
+    # warm sccache runs land around 30-60 min.
+    timeout-minutes: 350
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-windows-
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Alias VS Community to Enterprise
+        # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
+        # ...\2022\Community path; hosted runners ship VS2022 Enterprise.
+        # A junction keeps the upstream script untouched (zero merge surface).
+        shell: pwsh
+        run: |
+          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+          if (-not (Test-Path "$vsRoot\Community") -and (Test-Path "$vsRoot\Enterprise")) {
+            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target "$vsRoot\Enterprise" | Out-Null
+            Write-Host "Created junction: Community -> Enterprise"
+          } else {
+            Write-Host "VS Community path already present, skipping junction"
+          }
+
+      - name: Ensure Inno Setup 6
+        # windows-latest images ship Inno Setup 6 at the path the bundle
+        # script expects; choco is only a fallback for future image changes.
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Bundle Windows
+        shell: pwsh
+        run: script/bundle-windows.ps1 -Architecture ${{ inputs.architecture || 'x86_64' }}
+
+      - name: Show sccache stats
+        shell: pwsh
+        run: sccache --show-stats
+        if: always()
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-Windows-Installer-${{ inputs.architecture || 'x86_64' }}
+          path: |
+            target/Zed-*.exe
+            target/ZedEditorUserSetup-*.exe
+          if-no-files-found: error
+
+      - name: Upload remote server
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-remote-server-windows-${{ inputs.architecture || 'x86_64' }}
+          path: target/zed-remote-server-windows-*.zip
+          if-no-files-found: error
