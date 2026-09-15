@@ -58,28 +58,53 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Configure sccache wrapper + canary
-        # RUSTC_WRAPPER as bare "sccache" silently failed to engage in two
-        # full cold builds (0 compile requests). Use the absolute path from
-        # the action, start the server explicitly, and prove the wrapper
-        # engages with a 1-second canary compile before burning hours.
+        # RUSTC_WRAPPER is a cargo-level mechanism: a bare `rustc` call never
+        # consults it. The canary therefore builds a tiny cargo project (a
+        # staticlib, so no MSVC linker needed) and asserts the request
+        # counter actually moved, for the absolute wrapper path and the
+        # bare "sccache" name separately. Fails in ~1 min instead of
+        # discovering a dead cache after 3 hours of compiling.
         shell: pwsh
         run: |
           "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
           "SCCACHE_ERROR_LOG=$env:RUNNER_TEMP\sccache-error.log" >> $env:GITHUB_ENV
           & $env:SCCACHE_PATH --stop-server 2>$null
           & $env:SCCACHE_PATH --start-server
-          Write-Host "RUSTC_WRAPPER will be: $env:SCCACHE_PATH"
           $dir = Join-Path $env:RUNNER_TEMP "wrapcanary"
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          Set-Content -Path (Join-Path $dir "canary.rs") -Value 'fn main() {}'
-          $env:RUSTC_WRAPPER = $env:SCCACHE_PATH
-          rustc (Join-Path $dir "canary.rs") -o (Join-Path $dir "canary.exe")
-          $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
-          Write-Host $stats
-          if ($stats -match "Compile requests\s+0") {
-            throw "sccache wrapper did not engage (canary compile bypassed it). RUSTC_WRAPPER='$env:RUSTC_WRAPPER'"
+          New-Item -ItemType Directory -Force (Join-Path $dir "src") | Out-Null
+          Set-Content (Join-Path $dir "Cargo.toml") @'
+          [package]
+          name = "wrapcanary"
+          version = "0.0.0"
+          edition = "2021"
+
+          [lib]
+          crate-type = ["staticlib"]
+          '@
+          Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping() {}'
+          $manifest = Join-Path $dir "Cargo.toml"
+          function Get-Requests {
+            $s = (& $env:SCCACHE_PATH --show-stats) | Out-String
+            if ($s -match "Compile requests\s+(\d+)") { return [int]$Matches[1] }
+            return -1
           }
-          Write-Host "sccache wrapper canary OK"
+          $env:RUSTC_WRAPPER = $env:SCCACHE_PATH
+          cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 3
+          $abs = Get-Requests
+          Write-Host "== requests after absolute-path canary: $abs"
+          Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping2() {}'
+          $env:RUSTC_WRAPPER = "sccache"
+          cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 3
+          $bare = Get-Requests
+          Write-Host "== requests after bare-name canary: $bare"
+          $env:RUSTC_WRAPPER = $env:SCCACHE_PATH
+          if ($abs -lt 1) {
+            throw "sccache not engaged even with absolute wrapper path '$env:SCCACHE_PATH'. Check sccache-error-log artifact."
+          }
+          if ($bare -lt ($abs + 1)) {
+            Write-Host "WARNING: bare 'sccache' does not engage on this runner; absolute path (already exported) is required."
+          }
+          Write-Host "sccache canary OK (absolute=$abs, bare=$bare)"
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
