@@ -56,25 +56,27 @@ jobs:
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
-        # ...\2022\Community path. Hosted runners ship VS2022 Enterprise,
-        # and may also carry an incomplete Community directory, so key off
-        # Launch-VsDevShell.ps1 itself and junction to whichever edition
-        # actually has it. This keeps the upstream script untouched.
+        # ...\2022\Community path. Locate the real VS installation with
+        # vswhere (image-independent) and junction it to the expected path,
+        # keeping the upstream script untouched (zero merge surface).
         shell: pwsh
         run: |
           $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
           $launch = "$vsRoot\Community\Common7\Tools\Launch-VsDevShell.ps1"
-          Get-ChildItem $vsRoot -Directory | ForEach-Object { Write-Host "VS edition dir: $($_.Name)" }
           if (-not (Test-Path $launch)) {
-            $edition = Get-ChildItem $vsRoot -Directory |
-              Where-Object { Test-Path "$($_.FullName)\Common7\Tools\Launch-VsDevShell.ps1" } |
-              Select-Object -First 1
-            if (-not $edition) { throw "No VS edition with Launch-VsDevShell.ps1 under $vsRoot" }
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
+            $installPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath | Select-Object -First 1
+            if (-not $installPath) { throw "vswhere found no VS install with MSVC tools" }
+            Write-Host "vswhere installationPath: $installPath"
+            New-Item -ItemType Directory -Force -Path $vsRoot | Out-Null
             if (Test-Path "$vsRoot\Community") {
               Rename-Item "$vsRoot\Community" "Community.incomplete" -Force
             }
-            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $edition.FullName | Out-Null
-            Write-Host "Junctioned Community -> $($edition.Name)"
+            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $installPath | Out-Null
+            Write-Host "Junctioned Community -> $installPath"
           }
           if (-not (Test-Path $launch)) { throw "Launch-VsDevShell.ps1 still missing after junction" }
           Write-Host "Launch-VsDevShell.ps1 present"
