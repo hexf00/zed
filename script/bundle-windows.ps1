@@ -159,10 +159,12 @@ function ZipZedAndItsFriendsDebug {
         ".\$CargoOutDir\zed.pdb",
         ".\$CargoOutDir\cli.pdb",
         ".\$CargoOutDir\auto_update_helper.pdb",
-        ".\$CargoOutDir\explorer_command_injector.pdb",
-        ".\$CargoOutDir\remote_server.pdb"
+        ".\$CargoOutDir\explorer_command_injector.pdb"
     )
-
+    # fork: remote_server is skipped when ZED_FORK_SKIP_REMOTE_SERVER is set
+    if (-not $env:ZED_FORK_SKIP_REMOTE_SERVER) {
+        $items += ".\$CargoOutDir\remote_server.pdb"
+    }
     Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
 }
 
@@ -385,7 +387,12 @@ CheckEnvironmentVariables
 PrepareForBundle
 GenerateLicenses
 BuildZedAndItsFriends
-BuildRemoteServer
+# fork: allow skipping remote_server (largest non-editor product); unset = upstream behavior
+if (-not $env:ZED_FORK_SKIP_REMOTE_SERVER) {
+    BuildRemoteServer
+} else {
+    Write-Output "Skipping remote_server build (ZED_FORK_SKIP_REMOTE_SERVER is set)"
+}
 MakeAppx
 SignZedAndItsFriends
 ZipZedAndItsFriendsDebug
