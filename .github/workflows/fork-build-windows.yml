@@ -104,7 +104,40 @@ jobs:
           if ($bare -lt ($abs + 1)) {
             Write-Host "WARNING: bare 'sccache' does not engage on this runner; absolute path (already exported) is required."
           }
-          Write-Host "sccache canary OK (absolute=$abs, bare=$bare)"
+
+          # 3) Replicate the bundle script context: it dot-sources
+          # Launch-VsDevShell.ps1 before cargo. Probe whether the wrapper
+          # still engages there (priming build showed 1385 cargo compiles
+          # but zero extra sccache requests, so something in that context
+          # bypasses the wrapper).
+          . "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64
+          Write-Host "== RUSTC_WRAPPER after VsDevShell: '$env:RUSTC_WRAPPER'"
+          Write-Host "== sccache on PATH after VsDevShell: $((Get-Command sccache -ErrorAction SilentlyContinue).Source ?? 'NOT FOUND')"
+          Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping3() {}'
+          cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 2
+          $vs = Get-Requests
+          Write-Host "== requests after VsDevShell canary: $vs"
+
+          # 4) Mirror .cargo/bundle-config.toml (--config with [env] + rustflags)
+          Set-Content (Join-Path $dir "probe-config.toml") @'
+          [env]
+          RUSTC_BOOTSTRAP = "1"
+
+          [build]
+          rustflags = ["-Z", "share-generics=y"]
+          '@
+          Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping4() {}'
+          cargo --config (Join-Path $dir "probe-config.toml") build --manifest-path $manifest 2>&1 | Select-Object -Last 2
+          $cfg = Get-Requests
+          Write-Host "== requests after --config canary: $cfg"
+
+          if ($vs -lt ($cfg - 1) -and $vs -lt 10) {
+            Write-Host "WARNING: wrapper does not engage under VsDevShell context - bundle build will not be cached."
+          }
+          if ($cfg -lt ($vs + 1)) {
+            Write-Host "WARNING: wrapper does not engage with --config ([env]+rustflags) - mirroring bundle-config.toml."
+          }
+          Write-Host "sccache canary OK (absolute=$abs, bare=$bare, vsdevshell=$vs, withconfig=$cfg)"
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
