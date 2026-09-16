@@ -108,6 +108,7 @@ fork 对上游源码的全部改动都必须登记在这里,同步上游时逐�
 | 改动 | 文件 | 内容 | 恢复方式 |
 |------|------|------|----------|
 | SKIP-1 | `script/bundle-windows.ps1` | 跳过 remote_server 构建(fork 用不到 SSH 远程开发;它占上游冷构建约 40%)。由 `ZED_FORK_SKIP_REMOTE_SERVER=1` 环境变量门控,不设变量时行为与上游完全一致;同时 pdb 打包列表做了相应条件化 | workflow 里删掉该环境变量即可,脚本改动可无害保留 |
+| LNK-1 | `.cargo/bundle-config.toml` | Windows 目标链接器换 rust-lld(link.exe 链 zed.exe ~200MB exe + ~2GB PDB 在 4 核上 ~63 分钟;lld 并行实现,预期分钟级)。上游若改此文件按上游内容重建本改动 | 删除两个 `[target.*-pc-windows-msvc]` 段即可 |
 | CFG-1 | `assets/settings/initial_user_settings.json` | 出厂静默:`auto_update=false`(防止官方更新覆盖 fork 构建)、telemetry 上报关闭、关闭 html 扩展自动下载 | 用户级 settings 覆盖即可,文件改动可无害保留 |
 
 上游同步时:该脚本若被上游修改,冲突处理原则是保留上游逻辑、重新套用
