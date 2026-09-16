@@ -16,6 +16,7 @@
   },
 
   // ---- fork defaults (docs/fork-maintenance.md diff inventory CFG-1) ----
+  // iteration test: content change for lld + SOURCE_DATE_EPOCH measurement
   // Never let official Zed auto-update overwrite this fork build.
   "auto_update": false,
   // No crash/usage reporting.
