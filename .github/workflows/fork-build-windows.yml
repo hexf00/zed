@@ -78,10 +78,10 @@ jobs:
             git rev-parse HEAD:crates/zed/RELEASE_CHANNEL
           )
           $sha = [System.Security.Cryptography.SHA256]::Create()
-          $digest = [BitConverter]::ToString(
-            $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($parts -join "`n)))
-          ).Replace("-", "").Substring(0, 16).ToLower()
-          $key = "zed-installer-$arch-$digest"
+          $concat = [string]::Join([string][char]10, $parts)
+          $bytes = [Text.Encoding]::UTF8.GetBytes($concat)
+          $digest = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').Substring(0, 16).ToLower()
+          $key = 'zed-installer-' + $arch + '-' + $digest
           $epoch = git log -1 --format=%ct
           "ARTIFACT_KEY=$key" >> $env:GITHUB_ENV
           "ARTIFACT_KEY=$key" >> $env:GITHUB_OUTPUT
