@@ -60,15 +60,33 @@ jobs:
 
       - name: Compute content keys
         id: keys
+        # Cache keys are CONTENT-addressed, never commit-addressed: the
+        # commit changes on every merge, the build-relevant content does
+        # not. git tree/blob OIDs of the build-relevant paths give exactly
+        # that - a docs-only or workflow-only change keeps the same key
+        # and the previously built installer is reused as-is.
         shell: pwsh
         run: |
           $arch = "${{ inputs.architecture || 'x86_64' }}"
-          $scriptHash = (Get-FileHash script/bundle-windows.ps1 -Algorithm SHA256).Hash.Substring(0, 12).ToLower()
-          $key = "zed-installer-$arch-${{ github.sha }}-$scriptHash"
+          $parts = @(
+            git rev-parse HEAD:crates
+            git rev-parse HEAD:assets
+            git rev-parse HEAD:Cargo.lock
+            git rev-parse HEAD:rust-toolchain.toml
+            git rev-parse HEAD:.cargo/bundle-config.toml
+            git rev-parse HEAD:script/bundle-windows.ps1
+            git rev-parse HEAD:crates/zed/RELEASE_CHANNEL
+          )
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          $digest = [BitConverter]::ToString(
+            $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($parts -join "`n)))
+          ).Replace("-", "").Substring(0, 16).ToLower()
+          $key = "zed-installer-$arch-$digest"
           $epoch = git log -1 --format=%ct
           "ARTIFACT_KEY=$key" >> $env:GITHUB_ENV
           "ARTIFACT_KEY=$key" >> $env:GITHUB_OUTPUT
           "SOURCE_DATE_EPOCH=$epoch" >> $env:GITHUB_ENV
+          Write-Host "content parts:"; $parts | ForEach-Object { Write-Host "  $_" }
           Write-Host "artifact key: $key"
           Write-Host "SOURCE_DATE_EPOCH: $epoch (commit time - keep time out of build inputs)"
 
