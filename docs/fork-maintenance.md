@@ -38,16 +38,25 @@ fork 基础设施文件(`.github/workflows/fork-*.yml`、`docs/fork-maintenance.
 - 费用与时长上限:本 fork 是**公开仓库**,GitHub Actions 免费、不限时长
   (2000 分钟/月额度只对私有仓库生效);唯一硬限制是单 job 6 小时,
   workflow 的 timeout 350 分钟留了余量。
-- 产物:未签名的 Windows 安装包 + zed-remote-server zip,在 run 的 Artifacts 里下载。
-- 缓存:sccache(GHA backend)+ cargo registry 缓存。两个规则要记住:
-  - GHA 缓存总量约 10GB,LRU 逐出;
-  - **7 天未被访问的缓存条目会被清除**——超过一周不构建,下次会向冷构建回落。
-  - 建议:至少每周(比如每次上游同步后)手动构建一次,让缓存保持热。
-- 时长预期(4 核托管 runner):
-  - 首次冷构建:约 2.5–4 小时(上游 32 核冷构建约 31 分钟,核心数差 8 倍);
-    这次构建同时把 sccache 填满,是最慢的一次,也是唯一一次;
-  - 之后暖缓存:约 30–60 分钟(只剩自研 crate 重编 + 链接 + 打包);
-  - 签名/Inno Setup/打包约 5 分钟,缓存无法消除。
+- **缓存是三层的,粒度各不同**:
+  1. **成品层(内容寻址)**:key = hash(crates 树 + assets 树 + Cargo.lock +
+     工具链 + 打包配置 + 打包脚本 + RELEASE_CHANNEL) + 架构。**commit 变化
+     不影响 key**——只有构建相关内容变了才会 miss。命中时整个构建直接跳过
+     (~4 分钟出包)。首次构建会把安装包存入该 key。
+  2. **crate 编译层(sccache)**:真实构建内部,未变的依赖 crate 以 0–1 秒
+     回放(实测命中率 84%)。cargo 照样打印 `Compiling`,看耗时而不是看行。
+  3. **依赖源码层**:cargo registry 缓存。
+- 时长预期:x86_64 免费托管 runner(4 核):
+  - 同内容重跑:**~4 分钟**(成品层命中);
+  - 内容有变化的构建:约 2 小时(63 分钟 zed.exe 链接是地板,链接永远
+    不可缓存;~283 个 crate 因构建脚本嵌入时间戳/路径而必然重编,
+    SOURCE_DATE_EPOCH 已钉死 commit 时间来压缩这一块);
+  - 首次冷构建:约 2.5–4 小时。
+- **换内容后想立即拿到旧产物**:不存在——内容变了产物就是新的;但可以为
+  指定 run 做 `seed_from_run=<run_id>` 输入,把某个历史 run 的安装包登记到
+  当前内容 key 下(用于迁移/修复缓存)。
+- 已知残余杠杆:链接换 rust-lld(fork 配置一行)可把 63 分钟压到 15–25
+  分钟,服务"内容变了必须重链"的场景;需要时再加。
 - 已做的环境适配(不改上游脚本):
   - VS 2022 Community → Enterprise 目录 junction(bundle 脚本硬编码了 Community 路径);
   - Inno Setup 6 缺失时 choco 兜底;
