@@ -36,6 +36,9 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      # sccache servers idle-exit after 10min by default; the big build
+      # starts compiling well after the canary finished, keep it alive.
+      SCCACHE_IDLE_TIMEOUT: "7200"
       # Fork slimming (see docs/fork-maintenance.md): skip remote_server,
       # the largest non-editor product we never use. Requires the matching
       # fork: commit in script/bundle-windows.ps1 on the custom branch.
@@ -128,53 +131,28 @@ jobs:
           cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 3
           $abs = Get-Requests
           Write-Host "== requests after absolute-path canary: $abs"
+          # 2) pinned toolchain + --release + --target (real build flags)
           Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping2() {}'
-          $env:RUSTC_WRAPPER = "sccache"
-          cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 3
-          $bare = Get-Requests
-          Write-Host "== requests after bare-name canary: $bare"
-          $env:RUSTC_WRAPPER = $env:SCCACHE_PATH
-          if ($abs -lt 1) {
-            throw "sccache not engaged even with absolute wrapper path '$env:SCCACHE_PATH'. Check sccache-error-log artifact."
-          }
-          if ($bare -lt ($abs + 1)) {
-            Write-Host "WARNING: bare 'sccache' does not engage on this runner; absolute path (already exported) is required."
+          rustup run 1.98.1 cargo build --release --target x86_64-pc-windows-msvc --manifest-path $manifest 2>&1 | Select-Object -Last 2
+          $pinned = Get-Requests
+          Write-Host "== requests after pinned-toolchain canary: $pinned"
+          if ($pinned -le $abs) {
+            throw "sccache does not engage with the pinned 1.98.1 toolchain (requests $abs -> $pinned)."
           }
 
-          # 3) Replicate the bundle script context: it dot-sources
-          # Launch-VsDevShell.ps1 before cargo. Probe whether the wrapper
-          # still engages there (priming build showed 1385 cargo compiles
-          # but zero extra sccache requests, so something in that context
-          # bypasses the wrapper).
-          $before = Get-Requests
-          . "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64
-          Write-Host "== RUSTC_WRAPPER after VsDevShell: '$env:RUSTC_WRAPPER'"
-          Write-Host "== sccache on PATH after VsDevShell: $((Get-Command sccache -ErrorAction SilentlyContinue).Source ?? 'NOT FOUND')"
-          Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping3() {}'
-          cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 2
-          $vs = Get-Requests
-          Write-Host "== requests after VsDevShell canary: $vs"
-          if ($vs -le $before) {
-            throw "sccache does not engage under the VsDevShell context (requests $before -> $vs, RUSTC_WRAPPER='$env:RUSTC_WRAPPER'). The bundle build would run uncached - fix before proceeding."
+          # 3) the real invocation: repo root, bundle-config.toml, --release,
+          # --target, a first-party crate (also pre-banks its compiles)
+          $before = $pinned
+          Push-Location $env:GITHUB_WORKSPACE
+          rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1 2>&1 | Out-Null
+          cargo --config .cargo/bundle-config.toml check -p sqlez_macros --release --target x86_64-pc-windows-msvc 2>&1 | Select-Object -Last 2
+          Pop-Location
+          $real = Get-Requests
+          Write-Host "== requests after real-invocation canary: $real"
+          if ($real -le $before) {
+            throw "sccache does not engage for the real repo/config/target invocation (requests $before -> $real)."
           }
-
-          # 4) Mirror .cargo/bundle-config.toml (--config with [env] + rustflags)
-          $before = $vs
-          Set-Content (Join-Path $dir "probe-config.toml") @'
-          [env]
-          RUSTC_BOOTSTRAP = "1"
-
-          [build]
-          rustflags = ["-Z", "share-generics=y"]
-          '@
-          Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping4() {}'
-          cargo --config (Join-Path $dir "probe-config.toml") build --manifest-path $manifest 2>&1 | Select-Object -Last 2
-          $cfg = Get-Requests
-          Write-Host "== requests after --config canary: $cfg"
-          if ($cfg -le $before) {
-            throw "sccache does not engage with --config ([env]+rustflags mirror of bundle-config.toml), requests $before -> $cfg."
-          }
-          Write-Host "sccache canary OK in all contexts (absolute=$abs, bare=$bare, vsdevshell=$vs, withconfig=$cfg)"
+          Write-Host "sccache canary OK (absolute=$abs, pinned=$pinned, real=$real)"
 
       - name: Bundle Windows
         shell: pwsh
@@ -187,7 +165,7 @@ jobs:
         if: always()
 
       - name: Upload sccache error log
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sccache-error-log
