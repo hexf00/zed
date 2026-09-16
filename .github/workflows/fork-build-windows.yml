@@ -1,6 +1,12 @@
 # Fork-only workflow: build a personal Zed for Windows.
 # Upstream's release.yml is gated to zed-industries and left untouched;
 # this file is additive so upstream merges stay conflict-free.
+#
+# Caching model (content-addressed, three layers):
+#   1. artifact memoization: key = commit + bundle-script hash + arch.
+#      Same key -> restore the installer, skip the entire build.
+#   2. sccache: per-crate compilation products (GHA backend).
+#   3. cargo registry cache: dependency sources.
 name: Fork Windows Build
 
 on:
@@ -13,25 +19,30 @@ on:
         options:
           - x86_64
           - aarch64
+      seed_from_run:
+        description: "Optional: seed the artifact cache from this run id, then exit"
+        required: false
+        type: string
   # Manual-only by design: cold/warm builds are hours long, so nothing
   # triggers them implicitly. Public repos get free unlimited Actions
   # minutes; the only cap is 6h per job (timeout below leaves headroom).
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: fork-build-windows-${{ github.ref }}
   # Canceling is cheap with sccache: finished crate compilations are
-  # already persisted, only in-flight work is lost. A newer manual run
-  # supersedes an older one on the same ref.
+  # already persisted, only in-flight work is lost.
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: windows-latest
-    # First run is a cold 4-core release build (expect 2.5-4h);
-    # warm sccache runs land around 30-60 min.
+    # First run for a commit is a cold 4-core release build (expect ~2h
+    # slimmed); any repeat of the same commit restores the installer in
+    # minutes via the artifact cache key.
     timeout-minutes: 350
     env:
       CARGO_INCREMENTAL: "0"
@@ -47,7 +58,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Compute content keys
+        id: keys
+        shell: pwsh
+        run: |
+          $arch = "${{ inputs.architecture || 'x86_64' }}"
+          $scriptHash = (Get-FileHash script/bundle-windows.ps1 -Algorithm SHA256).Hash.Substring(0, 12).ToLower()
+          $key = "zed-installer-$arch-${{ github.sha }}-$scriptHash"
+          $epoch = git log -1 --format=%ct
+          "ARTIFACT_KEY=$key" >> $env:GITHUB_ENV
+          "ARTIFACT_KEY=$key" >> $env:GITHUB_OUTPUT
+          "SOURCE_DATE_EPOCH=$epoch" >> $env:GITHUB_ENV
+          Write-Host "artifact key: $key"
+          Write-Host "SOURCE_DATE_EPOCH: $epoch (commit time - keep time out of build inputs)"
+
+      - name: Seed artifact cache from previous run
+        if: inputs.seed_from_run != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force target | Out-Null
+          gh run download ${{ inputs.seed_from_run }} -R "${{ github.repository }}" `
+            -n "Zed-Windows-Installer-${{ inputs.architecture || 'x86_64' }}" -D target
+          Get-ChildItem target
+
+      - name: Save artifact cache (seeded)
+        if: inputs.seed_from_run != ''
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ steps.keys.outputs.ARTIFACT_KEY }}
+          path: target/Zed-*.exe
+
+      - name: Restore installer for this exact commit
+        id: restore
+        if: inputs.seed_from_run == ''
+        uses: actions/cache/restore@v4
+        with:
+          key: ${{ steps.keys.outputs.ARTIFACT_KEY }}
+          path: target/Zed-*.exe
+
       - name: Cache cargo registry
+        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -58,6 +110,7 @@ jobs:
           restore-keys: cargo-registry-windows-
 
       - name: Setup sccache
+        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Alias VS Community to Enterprise
@@ -65,6 +118,7 @@ jobs:
         # ...\2022\Community path. Locate the real VS installation with
         # vswhere (image-independent) and junction it to the expected path,
         # keeping the upstream script untouched (zero merge surface).
+        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
@@ -90,6 +144,7 @@ jobs:
       - name: Ensure Inno Setup 6
         # windows-latest images ship Inno Setup 6 at the path the bundle
         # script expects; choco is only a fallback for future image changes.
+        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
@@ -100,9 +155,10 @@ jobs:
         # RUSTC_WRAPPER is a cargo-level mechanism: a bare `rustc` call never
         # consults it. The canary therefore builds a tiny cargo project (a
         # staticlib, so no MSVC linker needed) and asserts the request
-        # counter actually moved, for the absolute wrapper path and the
-        # bare "sccache" name separately. Fails in ~1 min instead of
-        # discovering a dead cache after 3 hours of compiling.
+        # counter actually moved, for the absolute wrapper path and against
+        # the real repo invocation. Fails in ~1 min instead of discovering
+        # a dead cache after 3 hours of compiling.
+        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
@@ -128,9 +184,10 @@ jobs:
             return -1
           }
           $env:RUSTC_WRAPPER = $env:SCCACHE_PATH
-          cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 3
+          cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 2
           $abs = Get-Requests
           Write-Host "== requests after absolute-path canary: $abs"
+
           # 2) pinned toolchain + --release + --target (real build flags)
           Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping2() {}'
           rustup run 1.98.1 cargo build --release --target x86_64-pc-windows-msvc --manifest-path $manifest 2>&1 | Select-Object -Last 2
@@ -155,6 +212,7 @@ jobs:
           Write-Host "sccache canary OK (absolute=$abs, pinned=$pinned, real=$real)"
 
       - name: Bundle Windows
+        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         shell: pwsh
         run: script/bundle-windows.ps1 -Architecture ${{ inputs.architecture || 'x86_64' }}
 
@@ -162,10 +220,19 @@ jobs:
         shell: pwsh
         run: |
           & $env:SCCACHE_PATH --show-stats
-        if: always()
+        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true' && always()
+
+      - name: Save artifact cache
+        # The built installer becomes the content-addressed product for
+        # this commit; identical keys restore it instead of rebuilding.
+        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ steps.keys.outputs.ARTIFACT_KEY }}
+          path: target/Zed-*.exe
 
       - name: Upload sccache error log
-        if: always()
+        if: always() && inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: sccache-error-log
@@ -173,18 +240,11 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload installer
+        if: inputs.seed_from_run == ''
         uses: actions/upload-artifact@v4
         with:
           name: Zed-Windows-Installer-${{ inputs.architecture || 'x86_64' }}
           path: |
             target/Zed-*.exe
             target/ZedEditorUserSetup-*.exe
-          if-no-files-found: error
-
-      - name: Upload remote server
-        uses: actions/upload-artifact@v4
-        if: env.ZED_FORK_SKIP_REMOTE_SERVER != '1'
-        with:
-          name: zed-remote-server-windows-${{ inputs.architecture || 'x86_64' }}
-          path: target/zed-remote-server-windows-*.zip
           if-no-files-found: error
