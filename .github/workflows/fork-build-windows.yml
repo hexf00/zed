@@ -57,6 +57,42 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Alias VS Community to Enterprise
+        # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
+        # ...\2022\Community path. Locate the real VS installation with
+        # vswhere (image-independent) and junction it to the expected path,
+        # keeping the upstream script untouched (zero merge surface).
+        shell: pwsh
+        run: |
+          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+          $launch = "$vsRoot\Community\Common7\Tools\Launch-VsDevShell.ps1"
+          if (-not (Test-Path $launch)) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
+            $installPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath | Select-Object -First 1
+            if (-not $installPath) { throw "vswhere found no VS install with MSVC tools" }
+            Write-Host "vswhere installationPath: $installPath"
+            New-Item -ItemType Directory -Force -Path $vsRoot | Out-Null
+            if (Test-Path "$vsRoot\Community") {
+              Rename-Item "$vsRoot\Community" "Community.incomplete" -Force
+            }
+            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $installPath | Out-Null
+            Write-Host "Junctioned Community -> $installPath"
+          }
+          if (-not (Test-Path $launch)) { throw "Launch-VsDevShell.ps1 still missing after junction" }
+          Write-Host "Launch-VsDevShell.ps1 present"
+
+      - name: Ensure Inno Setup 6
+        # windows-latest images ship Inno Setup 6 at the path the bundle
+        # script expects; choco is only a fallback for future image changes.
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
       - name: Configure sccache wrapper + canary
         # RUSTC_WRAPPER is a cargo-level mechanism: a bare `rustc` call never
         # consults it. The canary therefore builds a tiny cargo project (a
@@ -139,42 +175,6 @@ jobs:
             throw "sccache does not engage with --config ([env]+rustflags mirror of bundle-config.toml), requests $before -> $cfg."
           }
           Write-Host "sccache canary OK in all contexts (absolute=$abs, bare=$bare, vsdevshell=$vs, withconfig=$cfg)"
-
-      - name: Alias VS Community to Enterprise
-        # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
-        # ...\2022\Community path. Locate the real VS installation with
-        # vswhere (image-independent) and junction it to the expected path,
-        # keeping the upstream script untouched (zero merge surface).
-        shell: pwsh
-        run: |
-          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
-          $launch = "$vsRoot\Community\Common7\Tools\Launch-VsDevShell.ps1"
-          if (-not (Test-Path $launch)) {
-            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-            if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
-            $installPath = & $vswhere -latest -products * `
-              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-              -property installationPath | Select-Object -First 1
-            if (-not $installPath) { throw "vswhere found no VS install with MSVC tools" }
-            Write-Host "vswhere installationPath: $installPath"
-            New-Item -ItemType Directory -Force -Path $vsRoot | Out-Null
-            if (Test-Path "$vsRoot\Community") {
-              Rename-Item "$vsRoot\Community" "Community.incomplete" -Force
-            }
-            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $installPath | Out-Null
-            Write-Host "Junctioned Community -> $installPath"
-          }
-          if (-not (Test-Path $launch)) { throw "Launch-VsDevShell.ps1 still missing after junction" }
-          Write-Host "Launch-VsDevShell.ps1 present"
-
-      - name: Ensure Inno Setup 6
-        # windows-latest images ship Inno Setup 6 at the path the bundle
-        # script expects; choco is only a fallback for future image changes.
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
-            choco install innosetup -y --no-progress
-          }
 
       - name: Bundle Windows
         shell: pwsh
