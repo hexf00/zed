@@ -42,6 +42,11 @@ jobs:
     timeout-minutes: 350
     env:
       CARGO_INCREMENTAL: "0"
+      # Concurrent cache pulls: every replay hit is a sccache lookup driven
+      # by cargo's job count, so 16 jobs pull the store 16-way instead of
+      # 4-way (~1min for the full store on warm runs). Real compiles are
+      # CPU-bound and unaffected apart from oversubscription.
+      CARGO_BUILD_JOBS: "16"
       # No debuginfo in fork builds: the ~2GB line-table PDB cost ~31min
       # per link (measured 18s with debug=0) and is never shipped anyway.
       # Flip back to "limited" only when a PDB is needed for dumps.
