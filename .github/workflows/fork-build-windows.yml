@@ -76,6 +76,7 @@ jobs:
             git rev-parse HEAD:.cargo/bundle-config.toml
             git rev-parse HEAD:script/bundle-windows.ps1
             git rev-parse HEAD:crates/zed/RELEASE_CHANNEL
+            git rev-parse HEAD:inno
           )
           $sha = [System.Security.Cryptography.SHA256]::Create()
           $concat = [string]::Join([string][char]10, $parts)
