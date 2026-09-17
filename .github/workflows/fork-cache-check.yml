@@ -1,0 +1,116 @@
+# Fork-only: fast cache-chain validation. NO Zed build - this job proves
+# the caching machinery itself in ~5 minutes:
+#   1. sccache engages via the absolute wrapper path (canary compile)
+#   2. compilations are BANKED and replay as hits (second compile = hit)
+#   3. engagement survives the real invocation context (repo root,
+#      pinned toolchain, bundle-config, --target)
+# Run this after any change to caching/workflow/build-config plumbing.
+# Full builds are only worth dispatching when this is green.
+name: Fork Cache Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-cache-check
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_IDLE_TIMEOUT: "7200"
+      ZED_FORK_SKIP_REMOTE_SERVER: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Alias VS Community to Enterprise
+        shell: pwsh
+        run: |
+          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+          $launch = "$vsRoot\Community\Common7\Tools\Launch-VsDevShell.ps1"
+          if (-not (Test-Path $launch)) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $installPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath | Select-Object -First 1
+            if (-not $installPath) { throw "no VS with MSVC tools found" }
+            New-Item -ItemType Directory -Force -Path $vsRoot | Out-Null
+            if (Test-Path "$vsRoot\Community") { Rename-Item "$vsRoot\Community" "Community.incomplete" -Force }
+            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $installPath | Out-Null
+          }
+
+      - name: Configure sccache wrapper
+        shell: pwsh
+        run: |
+          "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
+          & $env:SCCACHE_PATH --stop-server 2>$null
+          & $env:SCCACHE_PATH --start-server
+
+      - name: Cache chain assertions
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "cachetest"
+          New-Item -ItemType Directory -Force (Join-Path $dir "src") | Out-Null
+          Set-Content (Join-Path $dir "Cargo.toml") @'
+          [package]
+          name = "cachetest"
+          version = "0.0.0"
+          edition = "2021"
+
+          [lib]
+          crate-type = ["staticlib"]
+          '@
+          $manifest = Join-Path $dir "Cargo.toml"
+          function Get-Requests {
+            $s = (& $env:SCCACHE_PATH --show-stats) | Out-String
+            if ($s -match "Compile requests\s+(\d+)") { return [int]$Matches[1] }
+            return -1
+          }
+          function Get-Hits {
+            $s = (& $env:SCCACHE_PATH --show-stats) | Out-String
+            if ($s -match "Cache hits\s+(\d+)") { return [int]$Matches[1] }
+            return -1
+          }
+
+          # 1) engagement: absolute wrapper path
+          $env:RUSTC_WRAPPER = $env:SCCACHE_PATH
+          Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping1() {}'
+          cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 1
+          $r1 = Get-Requests
+          Write-Host "== after first build: requests=$r1"
+          if ($r1 -lt 1) { throw "FAIL: wrapper does not engage" }
+
+          # 2) banking + replay: identical rebuild must be a cache hit
+          $h1 = Get-Hits
+          cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 1
+          $h2 = Get-Hits
+          Write-Host "== rebuild same inputs: hits $h1 -> $h2"
+          if ($h2 -le $h1) { throw "FAIL: identical rebuild did not hit cache (hits $h1 -> $h2)" }
+
+          # 3) real invocation context: repo root + pinned toolchain + real config
+          $before = Get-Requests
+          Push-Location $env:GITHUB_WORKSPACE
+          rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1 2>&1 | Out-Null
+          cargo --config .cargo/bundle-config.toml check -p sqlez_macros --release --target x86_64-pc-windows-msvc 2>&1 | Select-Object -Last 2
+          Pop-Location
+          $r3 = Get-Requests
+          Write-Host "== after real-invocation probe: requests=$before -> $r3"
+          if ($r3 -le $before) { throw "FAIL: wrapper does not engage in the real repo/config/target context" }
+
+          Write-Host "CACHE CHAIN OK: engage=$r1 replay=+($($h2 - $h1)) real-context=$r3"
+
+      - name: Show sccache stats
+        if: always()
+        shell: pwsh
+        run: & $env:SCCACHE_PATH --show-stats
