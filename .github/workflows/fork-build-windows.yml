@@ -42,6 +42,10 @@ jobs:
     timeout-minutes: 350
     env:
       CARGO_INCREMENTAL: "0"
+      # No debuginfo in fork builds: the ~2GB line-table PDB cost ~31min
+      # per link (measured 18s with debug=0) and is never shipped anyway.
+      # Flip back to "limited" only when a PDB is needed for dumps.
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
       SCCACHE_GHA_ENABLED: "true"
       # sccache servers idle-exit after 10min by default; the big build
       # starts compiling well after the canary finished, keep it alive.
@@ -53,13 +57,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
-      - name: Upload cargo timings
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-timings
-          path: target/**/cargo-timings/cargo-timing.html
-          if-no-files-found: ignore
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -172,6 +169,17 @@ jobs:
       - name: Bundle Windows
         shell: pwsh
         run: script/bundle-windows.ps1 -Architecture ${{ inputs.architecture || 'x86_64' }}
+
+      - name: Upload cargo timings
+        # Must run AFTER the build: the timing html only exists once cargo
+        # finishes. (This step used to sit before the build and silently
+        # uploaded nothing.)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings
+          path: target/**/cargo-timings/cargo-timing.html
+          if-no-files-found: ignore
 
       - name: Show sccache stats
         if: always()
