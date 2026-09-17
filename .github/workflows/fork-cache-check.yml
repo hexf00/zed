@@ -110,6 +110,13 @@ jobs:
 
           Write-Host "CACHE CHAIN OK: engage=$r1 replay=+($($h2 - $h1)) real-context=$r3"
 
+          # Windows compile validation for workspace crates touched by
+          # cache/asset plumbing changes (fast fail before any full build)
+          Push-Location $env:GITHUB_WORKSPACE
+          cargo check -p util --target x86_64-pc-windows-msvc 2>&1 | Select-Object -Last 1
+          Pop-Location
+          Write-Host "cargo check -p util OK"
+
       - name: Show sccache stats
         if: always()
         shell: pwsh
