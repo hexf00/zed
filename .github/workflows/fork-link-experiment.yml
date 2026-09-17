@@ -1,0 +1,228 @@
+# Fork-only experiment: measure the Windows codegen/link/PDB split on real
+# CI runners. One workflow_dispatch = one data point; nothing ever builds
+# locally. Deliberately does NOT touch fork-build-windows.yml's installer
+# memoization keys and, by default, writes no sccache entries (a
+# flag-changed build would only evict production cache entries).
+#
+# Knobs cover the experiment matrix:
+#   debug=0           -> link floor with no debug info (PDB ~100MB)
+#   debug=limited     -> today's production profile (~2GB PDB baseline)
+#   fastlink=true     -> /DEBUG:FASTLINK, bounds the PDB-merge share
+#   lto=false         -> bounds the thin-LTO codegen share
+# A cold build is ~2h on the 4-vCPU runner; public-repo minutes are free,
+# so dispatch variants in parallel rather than batching.
+#
+# Dispatch on the custom ref: the bundle script's ZED_FORK_SKIP_REMOTE_SERVER
+# support lives there.
+name: Fork Link Experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: Short run label used in artifact names
+        required: true
+        type: string
+      debug:
+        description: CARGO_PROFILE_RELEASE_DEBUG value
+        type: choice
+        default: "0"
+        options:
+          - "0"
+          - "1"
+          - "2"
+          - "limited"
+          - "line-tables-only"
+          - "full"
+      lto:
+        description: Optional CARGO_PROFILE_RELEASE_LTO override (empty = upstream thin)
+        type: string
+        default: ""
+      fastlink:
+        description: Append /DEBUG:FASTLINK to the linker invocation
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
+      use_sccache:
+        description: Enable sccache (writes into the shared GHA cache)
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-link-experiment-${{ github.ref }}-${{ inputs.label }}
+  cancel-in-progress: true
+
+jobs:
+  experiment:
+    runs-on: windows-latest
+    timeout-minutes: 350
+    env:
+      CARGO_INCREMENTAL: "0"
+      ZED_FORK_SKIP_REMOTE_SERVER: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Export experiment profile
+        shell: pwsh
+        run: |
+          "CARGO_PROFILE_RELEASE_DEBUG=${{ inputs.debug }}" >> $env:GITHUB_ENV
+          if ("${{ inputs.lto }}" -ne "") {
+            "CARGO_PROFILE_RELEASE_LTO=${{ inputs.lto }}" >> $env:GITHUB_ENV
+          }
+          "EXP_LABEL=${{ inputs.label }}" >> $env:GITHUB_ENV
+
+      - name: Alias VS Community to Enterprise
+        # Same junction trick as fork-build-windows.yml: locate the real VS
+        # install with vswhere and junction it to the path that
+        # script/bundle-windows.ps1 hardcodes.
+        shell: pwsh
+        run: |
+          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+          $launch = "$vsRoot\Community\Common7\Tools\Launch-VsDevShell.ps1"
+          if (-not (Test-Path $launch)) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
+            $installPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath | Select-Object -First 1
+            if (-not $installPath) { throw "vswhere found no VS install with MSVC tools" }
+            Write-Host "vswhere installationPath: $installPath"
+            New-Item -ItemType Directory -Force -Path $vsRoot | Out-Null
+            if (Test-Path "$vsRoot\Community") {
+              Rename-Item "$vsRoot\Community" "Community.incomplete" -Force
+            }
+            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $installPath | Out-Null
+            Write-Host "Junctioned Community -> $installPath"
+          }
+          if (-not (Test-Path $launch)) { throw "Launch-VsDevShell.ps1 still missing after junction" }
+          Write-Host "Launch-VsDevShell.ps1 present"
+
+      - name: Setup sccache
+        if: inputs.use_sccache == 'true'
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Start sccache wrapper
+        if: inputs.use_sccache == 'true'
+        shell: pwsh
+        run: |
+          "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
+          "SCCACHE_GHA_ENABLED=true" >> $env:GITHUB_ENV
+          "SCCACHE_IDLE_TIMEOUT=7200" >> $env:GITHUB_ENV
+          & $env:SCCACHE_PATH --stop-server 2>$null
+          & $env:SCCACHE_PATH --start-server
+
+      - name: Write link timing shim
+        # Wrap the MSVC linker: wall-clock START/END per link invocation,
+        # and /TIME makes link.exe print per-phase timings into the build
+        # log. /DEBUG:FASTLINK (optional) skips global PDB merging, so its
+        # run vs the plain run bounds the PDB share of link time.
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "link-times.log"
+          $shim = Join-Path $env:RUNNER_TEMP "link-timing.cmd"
+          $extra = ""
+          if ("${{ inputs.fastlink }}" -eq "true") { $extra = "/DEBUG:FASTLINK" }
+          Set-Content -Path $shim -Encoding ascii -Value @"
+          @echo off
+          echo START %DATE% %TIME% >> "$log"
+          link.exe %* /TIME $extra
+          set EC=%ERRORLEVEL%
+          echo END ec=%EC% %DATE% %TIME% >> "$log"
+          exit /b %EC%
+          "@
+          Write-Host "--- link shim ---"
+          Get-Content $shim
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$shim" >> $env:GITHUB_ENV
+          "EXPERIMENT_LINK_LOG=$log" >> $env:GITHUB_ENV
+
+      - name: Run experiment build
+        # script/bundle-windows.ps1 IS the production cargo invocation
+        # (--config .cargo/bundle-config.toml --release --target ...), so
+        # measurements stay comparable with fork-build-windows runs.
+        shell: pwsh
+        run: |
+          $csv = Join-Path $env:RUNNER_TEMP "perf-samples.csv"
+          "time,cpu_pct,commit_gb,disk_write_mbps" | Set-Content $csv
+          $sampler = Join-Path $env:RUNNER_TEMP "sampler.ps1"
+          @'
+          param($Csv)
+          while ($true) {
+            $cpu = (Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
+            $os = Get-CimInstance Win32_OperatingSystem
+            $commitGB = [math]::Round(($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / 1MB, 2)
+            $dw = (Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'").DiskWriteBytesPersec / 1MB
+            "$(Get-Date -Format o),$cpu,$commitGB," + [math]::Round($dw, 1) | Add-Content $Csv
+            Start-Sleep -Seconds 10
+          }
+          '@ | Set-Content $sampler
+          $proc = Start-Process pwsh -ArgumentList @("-NoProfile", "-File", $sampler, $csv) -WindowStyle Hidden -PassThru
+          try {
+            script/bundle-windows.ps1 -Architecture x86_64
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Collect measurements
+        if: always()
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "experiment-summary.md"
+          $lines = @()
+          $lines += "# Link experiment: $env:EXP_LABEL"
+          $lines += "- debug: ${{ inputs.debug }} / fastlink: ${{ inputs.fastlink }} / lto: '${{ inputs.lto }}' / sccache: ${{ inputs.use_sccache }}"
+          $products = Get-ChildItem target -Recurse -Include zed.exe, zed.pdb -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\release\\' }
+          foreach ($f in $products) {
+            $lines += ("- {0}: {1:N1} MB  ({2})" -f $f.Name, ($f.Length / 1MB), $f.FullName)
+          }
+          if (Test-Path $env:EXPERIMENT_LINK_LOG) {
+            $lines += "## link invocations (wall clock)"
+            $lines += Get-Content $env:EXPERIMENT_LINK_LOG
+          }
+          $csvPath = Join-Path $env:RUNNER_TEMP "perf-samples.csv"
+          if (Test-Path $csvPath) {
+            $rows = Import-Csv $csvPath
+            if ($rows.Count -gt 0) {
+              $peakCommit = ($rows | Measure-Object -Property commit_gb -Maximum).Maximum
+              $peakCpu = ($rows | Measure-Object -Property cpu_pct -Maximum).Maximum
+              $peakDw = ($rows | Measure-Object -Property disk_write_mbps -Maximum).Maximum
+              $windowMin = [math]::Round(([datetime]$rows[-1].time - [datetime]$rows[0].time).TotalMinutes, 1)
+              $lines += "## resource peaks (sampled every 10s)"
+              $lines += "- build window: ~$windowMin min over $($rows.Count) samples"
+              $lines += "- peak commit: $peakCommit GB, peak cpu: $peakCpu %, peak disk write: $peakDw MB/s"
+            }
+          }
+          $lines | Set-Content $out
+          Write-Host "--- experiment summary ---"
+          Get-Content $out
+          Get-Content $out | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload experiment artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: link-experiment-${{ inputs.label }}
+          path: |
+            ${{ runner.temp }}/link-times.log
+            ${{ runner.temp }}/perf-samples.csv
+            ${{ runner.temp }}/experiment-summary.md
+          if-no-files-found: warn
+
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-${{ inputs.label }}
+          path: target/**/cargo-timings/cargo-timing.html
+          if-no-files-found: ignore
