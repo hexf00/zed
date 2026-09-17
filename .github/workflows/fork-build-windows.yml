@@ -2,11 +2,11 @@
 # Upstream's release.yml is gated to zed-industries and left untouched;
 # this file is additive so upstream merges stay conflict-free.
 #
-# Caching model (content-addressed, three layers):
-#   1. artifact memoization: key = commit + bundle-script hash + arch.
-#      Same key -> restore the installer, skip the entire build.
-#   2. sccache: per-crate compilation products (GHA backend).
-#   3. cargo registry cache: dependency sources.
+# Caching model (crate-granular, two layers — no whole-installer snapshot):
+#   1. sccache: per-crate compilation products (GHA backend).
+#   2. cargo registry cache: dependency sources.
+# Every run recompiles nothing that sccache has seen, then always relinks
+# and repackages: the installer is a fresh product of this run.
 name: Fork Windows Build
 
 on:
@@ -19,10 +19,6 @@ on:
         options:
           - x86_64
           - aarch64
-      seed_from_run:
-        description: "Optional: seed the artifact cache from this run id, then exit"
-        required: false
-        type: string
   # Manual-only by design: cold/warm builds are hours long, so nothing
   # triggers them implicitly. Public repos get free unlimited Actions
   # minutes; the only cap is 6h per job (timeout below leaves headroom).
@@ -40,9 +36,9 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
-    # First run for a commit is a cold 4-core release build (expect ~2h
-    # slimmed); any repeat of the same commit restores the installer in
-    # minutes via the artifact cache key.
+    # Cold 4-core release build (expect ~2h slimmed); with a warm sccache
+    # the unchanged crates replay in minutes and only the relink plus
+    # packaging remain.
     timeout-minutes: 350
     env:
       CARGO_INCREMENTAL: "0"
@@ -58,50 +54,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Compute content keys
-        id: keys
-        # Cache keys are CONTENT-addressed, never commit-addressed: the
-        # commit changes on every merge, the build-relevant content does
-        # not. git tree/blob OIDs of the build-relevant paths give exactly
-        # that - a docs-only or workflow-only change keeps the same key
-        # and the previously built installer is reused as-is.
-        shell: pwsh
-        run: |
-          $arch = "${{ inputs.architecture || 'x86_64' }}"
-          $parts = @(
-            git rev-parse HEAD:crates
-            git rev-parse HEAD:assets
-            git rev-parse HEAD:Cargo.lock
-            git rev-parse HEAD:rust-toolchain.toml
-            git rev-parse HEAD:.cargo/bundle-config.toml
-            git rev-parse HEAD:script/bundle-windows.ps1
-            git rev-parse HEAD:crates/zed/RELEASE_CHANNEL
-            git rev-parse HEAD:inno
-          )
-          $sha = [System.Security.Cryptography.SHA256]::Create()
-          $concat = [string]::Join([string][char]10, $parts)
-          $bytes = [Text.Encoding]::UTF8.GetBytes($concat)
-          $digest = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').Substring(0, 16).ToLower()
-          $key = 'zed-installer-' + $arch + '-' + $digest
-          $epoch = git log -1 --format=%ct
-          "ARTIFACT_KEY=$key" >> $env:GITHUB_ENV
-          "ARTIFACT_KEY=$key" >> $env:GITHUB_OUTPUT
-          "SOURCE_DATE_EPOCH=$epoch" >> $env:GITHUB_ENV
-          Write-Host "content parts:"; $parts | ForEach-Object { Write-Host "  $_" }
-          Write-Host "artifact key: $key"
-          Write-Host "SOURCE_DATE_EPOCH: $epoch (commit time - keep time out of build inputs)"
-
-      - name: Seed artifact cache from previous run
-        if: inputs.seed_from_run != ''
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          New-Item -ItemType Directory -Force target | Out-Null
-          gh run download ${{ inputs.seed_from_run }} -R "${{ github.repository }}" `
-            -n "Zed-Windows-Installer-${{ inputs.architecture || 'x86_64' }}" -D target
-          Get-ChildItem target
-
       - name: Upload cargo timings
         uses: actions/upload-artifact@v4
         with:
@@ -109,23 +61,7 @@ jobs:
           path: target/**/cargo-timings/cargo-timing.html
           if-no-files-found: ignore
 
-      - name: Save artifact cache (seeded)
-        if: inputs.seed_from_run != ''
-        uses: actions/cache/save@v4
-        with:
-          key: ${{ steps.keys.outputs.ARTIFACT_KEY }}
-          path: target/Zed-*.exe
-
-      - name: Restore installer for this exact commit
-        id: restore
-        if: inputs.seed_from_run == ''
-        uses: actions/cache/restore@v4
-        with:
-          key: ${{ steps.keys.outputs.ARTIFACT_KEY }}
-          path: target/Zed-*.exe
-
       - name: Cache cargo registry
-        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -136,7 +72,6 @@ jobs:
           restore-keys: cargo-registry-windows-
 
       - name: Setup sccache
-        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Alias VS Community to Enterprise
@@ -144,7 +79,6 @@ jobs:
         # ...\2022\Community path. Locate the real VS installation with
         # vswhere (image-independent) and junction it to the expected path,
         # keeping the upstream script untouched (zero merge surface).
-        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
@@ -170,7 +104,6 @@ jobs:
       - name: Ensure Inno Setup 6
         # windows-latest images ship Inno Setup 6 at the path the bundle
         # script expects; choco is only a fallback for future image changes.
-        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
@@ -184,7 +117,6 @@ jobs:
         # counter actually moved, for the absolute wrapper path and against
         # the real repo invocation. Fails in ~1 min instead of discovering
         # a dead cache after 3 hours of compiling.
-        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
@@ -238,27 +170,17 @@ jobs:
           Write-Host "sccache canary OK (absolute=$abs, pinned=$pinned, real=$real)"
 
       - name: Bundle Windows
-        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
         shell: pwsh
         run: script/bundle-windows.ps1 -Architecture ${{ inputs.architecture || 'x86_64' }}
 
       - name: Show sccache stats
+        if: always()
         shell: pwsh
         run: |
           & $env:SCCACHE_PATH --show-stats
-        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true' && always()
-
-      - name: Save artifact cache
-        # The built installer becomes the content-addressed product for
-        # this commit; identical keys restore it instead of rebuilding.
-        if: inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          key: ${{ steps.keys.outputs.ARTIFACT_KEY }}
-          path: target/Zed-*.exe
 
       - name: Upload sccache error log
-        if: always() && inputs.seed_from_run == '' && steps.restore.outputs.cache-hit != 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sccache-error-log
@@ -266,7 +188,6 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload installer
-        if: inputs.seed_from_run == ''
         uses: actions/upload-artifact@v4
         with:
           name: Zed-Windows-Installer-${{ inputs.architecture || 'x86_64' }}
