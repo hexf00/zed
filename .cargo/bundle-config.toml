@@ -3,12 +3,3 @@ RUSTC_BOOTSTRAP = "1"
 
 [build]
 rustflags = ["-Z", "share-generics=y"]
-
-# fork: rust-lld instead of MSVC link.exe. Linking zed.exe (~200MB exe +
-# ~2GB PDB) with link.exe took ~63min on a 4-core runner; lld-link is a
-# parallel rewrite that cuts this to minutes-scale. Ships with rustup.
-[target.x86_64-pc-windows-msvc]
-linker = "rust-lld"
-
-[target.aarch64-pc-windows-msvc]
-linker = "rust-lld"
