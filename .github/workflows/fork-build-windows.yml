@@ -3,7 +3,8 @@
 # this file is additive so upstream merges stay conflict-free.
 #
 # Caching model (crate-granular, two layers — no whole-installer snapshot):
-#   1. sccache: per-crate compilation products (GHA backend).
+#   1. sccache: per-crate compilation products in a local-disk store,
+#      bulk-prewarmed from / persisted to a single GHA cache entry.
 #   2. cargo registry cache: dependency sources.
 # Every run recompiles nothing that sccache has seen, then always relinks
 # and repackages: the installer is a fresh product of this run.
@@ -46,7 +47,13 @@ jobs:
       # per link (measured 18s with debug=0) and is never shipped anyway.
       # Flip back to "limited" only when a PDB is needed for dumps.
       CARGO_PROFILE_RELEASE_DEBUG: "0"
-      SCCACHE_GHA_ENABLED: "true"
+      # Local-disk store, bulk-prewarmed from one GHA cache entry (see the
+      # restore step): replay hits become concurrent local reads instead
+      # of one GHA cache API round trip per crate.
+      SCCACHE_DIR: ${{ runner.temp }}\sccache
+      # Self-prune the store so the single entry fits the shared 10GB
+      # GHA cache pool (alongside the cargo registry cache).
+      SCCACHE_CACHE_SIZE: "7G"
       # sccache servers idle-exit after 10min by default; the big build
       # starts compiling well after the canary finished, keep it alive.
       SCCACHE_IDLE_TIMEOUT: "7200"
@@ -57,6 +64,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Restore sccache store
+        # Prewarm: one bulk download of the whole per-crate store. Entries
+        # inside stay content-addressed by sccache; keys never reference
+        # commits, restore-keys rolls forward to the newest store.
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}\sccache
+          key: sccache-win-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-win-${{ runner.os }}-
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -186,6 +204,15 @@ jobs:
         shell: pwsh
         run: |
           & $env:SCCACHE_PATH --show-stats
+
+      - name: Save sccache store
+        # Persist the updated store as this run's entry; the next run's
+        # restore-keys picks it as the newest prefix match.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}\sccache
+          key: sccache-win-${{ runner.os }}-${{ github.run_id }}
 
       - name: Upload sccache error log
         if: always()
