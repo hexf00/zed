@@ -171,6 +171,22 @@ jobs:
           }
           Write-Host "sccache canary OK (absolute=$abs, pinned=$pinned, real=$real)"
 
+      - name: Prewarm sccache (pure pull pass)
+        # Pass 1 with the bundle script's exact command and env: on a warm
+        # store every unit is a sccache hit, so this phase is a pure
+        # 16-way concurrent pull of the whole store and compiles nothing;
+        # pass 2 (Bundle Windows) then finds everything fresh. Optimization
+        # only - a failure here must not kill the build.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $channel = (Get-Content crates/zed/RELEASE_CHANNEL -Raw).Trim()
+          $env:ZED_RELEASE_CHANNEL = $channel
+          $env:RELEASE_CHANNEL = $channel
+          rustup target add x86_64-pc-windows-msvc
+          cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --package auto_update_helper --target x86_64-pc-windows-msvc
+          cargo --config .cargo/bundle-config.toml build --release --package explorer_command_injector --target x86_64-pc-windows-msvc
+
       - name: Bundle Windows
         shell: pwsh
         run: script/bundle-windows.ps1 -Architecture ${{ inputs.architecture || 'x86_64' }}
