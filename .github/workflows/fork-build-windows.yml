@@ -173,24 +173,6 @@ jobs:
         shell: pwsh
         run: script/bundle-windows.ps1 -Architecture ${{ inputs.architecture || 'x86_64' }}
 
-      - name: Report target dir size
-        # Decision data for replacing sccache replay with a whole-target
-        # cargo-fresh cache: GHA cache caps a repo at 10GB, so feasibility
-        # hinges on the real on-disk size of the essential target subtree.
-        shell: pwsh
-        run: |
-          function Size-GB($p) {
-            if (-not (Test-Path $p)) { return "n/a" }
-            $s = (Get-ChildItem $p -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
-            return [math]::Round($s / 1GB, 2)
-          }
-          "target total:      $(Size-GB 'target') GB"
-          "target/<triple>:   $(Size-GB 'target/x86_64-pc-windows-msvc') GB"
-          "  release:         $(Size-GB 'target/x86_64-pc-windows-msvc/release') GB"
-          "  release/deps:    $(Size-GB 'target/x86_64-pc-windows-msvc/release/deps') GB"
-          "  release/build:   $(Size-GB 'target/x86_64-pc-windows-msvc/release/build') GB"
-          "  .fingerprint:    $(Size-GB 'target/x86_64-pc-windows-msvc/release/.fingerprint') GB"
-
       - name: Show sccache stats
         if: always()
         shell: pwsh
