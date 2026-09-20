@@ -69,6 +69,12 @@ jobs:
       # the largest non-editor product we never use. Requires the matching
       # fork: commit in script/bundle-windows.ps1 on the custom branch.
       ZED_FORK_SKIP_REMOTE_SERVER: "1"
+      # zed/cli build.rs embeds this via option_env! (ZED_BUILD_ID) and
+      # declares rerun-if-env-changed on it. The real per-run number made
+      # zed's sccache key drift every run (22min recompile); a stable
+      # value keeps first-party keys stable. Self-use fork: the build id
+      # is display-only metadata.
+      GITHUB_RUN_NUMBER: "fork-stable"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -82,6 +88,25 @@ jobs:
             ~/.cargo/git/db
           key: cargo-registry-windows-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-registry-windows-
+
+      - name: Restore uncacheable compiler layer
+        # sccache hard-refuses build-script bins (CannotCache bin) and
+        # proc-macro crates (CannotCache proc-macro); they recompile every
+        # run and their varying artifacts cascade ~250 first-party crates
+        # into misses. Persist exactly that layer (build-script outputs,
+        # proc-macro dlls, fingerprints) so cargo skips it and sccache
+        # keys downstream stay stable. Keys roll forward on
+        # Cargo.lock/toolchain changes; entries stay per-run unique.
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            target/x86_64-pc-windows-msvc/release/build
+            target/x86_64-pc-windows-msvc/release/deps/*.dll
+            target/x86_64-pc-windows-msvc/release/.fingerprint
+          key: uncacheable-layer-x86_64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            uncacheable-layer-x86_64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            uncacheable-layer-x86_64-
 
       - name: Setup sccache
         # v0.0.11 exports the cache-service env that modern sccache GHA
@@ -261,7 +286,9 @@ jobs:
           }
           if ($env:PREWARM_START) {
             $pullMin = [math]::Round(((Get-Date) - (Get-Date $env:PREWARM_START)).TotalMinutes, 1)
-            if ($pullMin -gt 15) { throw "prewarm pull took ${pullMin}min (>15) - pull path too slow, see sccache server log artifact" }
+            # 45min: first verification of the uncacheable-layer cache;
+            # tighten as the layer proves out.
+            if ($pullMin -gt 45) { throw "prewarm pull took ${pullMin}min (>45) - pull path too slow, see sccache server log artifact" }
             Write-Host "prewarm wall: ${pullMin}min"
           }
           if ($rustHit -lt 60) { throw "Rust hit rate ${rustHit}% < 60% - cache not effective" }
@@ -282,6 +309,19 @@ jobs:
           name: cargo-timings
           path: target/**/cargo-timings/*.html
           if-no-files-found: ignore
+
+      - name: Save uncacheable compiler layer
+        # Persist this run's layer as the newest entry for the next run's
+        # restore-keys. always(): a cancelled run still banked everything
+        # compiled before cancellation.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            target/x86_64-pc-windows-msvc/release/build
+            target/x86_64-pc-windows-msvc/release/deps/*.dll
+            target/x86_64-pc-windows-msvc/release/.fingerprint
+          key: uncacheable-layer-x86_64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
 
       - name: Show sccache stats
         if: always()
