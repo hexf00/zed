@@ -12,7 +12,7 @@ diff -ruN a/Cargo.toml b/Cargo.toml
  description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible. Sccache has the capability to utilize caching in remote storage environments, including various cloud storage options, or alternatively, in local storage."
 diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
 --- a/src/compiler/rust.rs	2026-09-21 02:51:04.951377272 +0800
-+++ b/src/compiler/rust.rs	2026-09-21 03:19:57.883949858 +0800
++++ b/src/compiler/rust.rs	2026-09-21 05:42:17.751103644 +0800
 @@ -26,7 +26,10 @@
  #[cfg(feature = "dist-client")]
  use crate::lru_disk_cache::{LruCache, Meter};
@@ -43,6 +43,70 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
          // Hash the contents of the staticlibs listed on the commandline.
          trace!(
              "[{}]: hashing {} staticlibs",
+@@ -1714,6 +1717,54 @@
+             ));
+         }
+ 
++        // FORK: optionally dump every key-input component for drift
++        // debugging (enabled via SCCACHE_FORK_DUMP_DIR).
++        let key = m.finish();
++        if let Ok(dir) = std::env::var("SCCACHE_FORK_DUMP_DIR") {
++            if !dir.is_empty() {
++                let mut out = String::new();
++                out.push_str(&format!("key\t{}\n", key));
++                for d in &self.compiler_shlibs_digests {
++                    out.push_str(&format!("shlib\t{}\n", d));
++                }
++                out.push_str(&format!("args\t{}\n", args.to_string_lossy()));
++                for (p, h) in source_files.iter().zip(source_hashes.iter()) {
++                    out.push_str(&format!("src\t{}\t{}\n", p.display(), h));
++                }
++                for (p, h) in abs_externs.iter().zip(extern_hashes.iter()) {
++                    out.push_str(&format!("extern\t{}\t{}\n", p.display(), h));
++                }
++                for (var, val) in env_deps.iter() {
++                    out.push_str(&format!(
++                        "envdep\t{}={}\n",
++                        var.to_string_lossy(),
++                        val.to_string_lossy()
++                    ));
++                }
++                for (var, val) in env_vars.iter() {
++                    if var.to_string_lossy().starts_with("CARGO_") {
++                        out.push_str(&format!(
++                            "cargovar\t{}={}\n",
++                            var.to_string_lossy(),
++                            val.to_string_lossy()
++                        ));
++                    }
++                }
++                out.push_str(&format!("cwd\t{}\n", cwd.display()));
++                out.push_str(&format!("rustc\t{}\n", self.version));
++                let ts = std::time::SystemTime::now()
++                    .duration_since(std::time::UNIX_EPOCH)
++                    .map(|d| d.as_millis())
++                    .unwrap_or(0);
++                let path = std::path::Path::new(&dir).join(format!(
++                    "{}-{}-{}.txt",
++                    self.parsed_args.crate_name, key, ts
++                ));
++                let _ = std::fs::create_dir_all(&dir);
++                let _ = std::fs::write(path, out);
++            }
++        }
++
+         let inputs = source_files
+             .into_iter()
+             .chain(abs_externs)
+@@ -1721,7 +1772,7 @@
+             .collect();
+ 
+         Ok(HashResult {
+-            key: m.finish(),
++            key,
+             compilation: Box::new(RustCompilation {
+                 executable: self.executable.clone(),
+                 host: self.host.clone(),
 diff -ruN a/src/util.rs b/src/util.rs
 --- a/src/util.rs	2026-09-21 02:51:04.963377813 +0800
 +++ b/src/util.rs	2026-09-21 03:48:32.716628003 +0800
