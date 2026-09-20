@@ -51,6 +51,10 @@ jobs:
       # Match production: at debug=0 the PE has no debug directory/PDB GUID,
       # isolating PE-timestamp variance from debug-info variance.
       CARGO_PROFILE_RELEASE_DEBUG: "0"
+      # Job-level so the sccache server inherits it no matter which process
+      # auto-starts it (client-started servers used to lose the inline env
+      # set in the Configure step, and with it the request log).
+      SCCACHE_ERROR_LOG: "D:\\a\\_temp\\sccache-server.log"
       # link.exe reads the LINK env var and prepends it to its options for
       # EVERY invocation (host artifacts included). With --target, cargo on
       # stable gives host artifacts (proc-macros/build scripts) NO rustflags
