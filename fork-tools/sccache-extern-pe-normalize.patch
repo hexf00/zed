@@ -12,7 +12,7 @@ diff -ruN a/Cargo.toml b/Cargo.toml
  description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible. Sccache has the capability to utilize caching in remote storage environments, including various cloud storage options, or alternatively, in local storage."
 diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
 --- a/src/compiler/rust.rs	2026-09-21 02:51:04.951377272 +0800
-+++ b/src/compiler/rust.rs	2026-09-21 05:42:17.751103644 +0800
++++ b/src/compiler/rust.rs	2026-09-21 05:52:04.765224855 +0800
 @@ -26,7 +26,10 @@
  #[cfg(feature = "dist-client")]
  use crate::lru_disk_cache::{LruCache, Meter};
@@ -43,7 +43,26 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
          // Hash the contents of the staticlibs listed on the commandline.
          trace!(
              "[{}]: hashing {} staticlibs",
-@@ -1714,6 +1717,54 @@
+@@ -1490,6 +1493,18 @@
+             target_json_hash
+         )?;
+ 
++        // FORK: capture path->digest pairs before the hashes are consumed.
++        let dump_src_pairs: Vec<(String, String)> = source_files
++            .iter()
++            .zip(source_hashes.iter())
++            .map(|(p, h)| (p.display().to_string(), h.clone()))
++            .collect();
++        let dump_extern_pairs: Vec<(String, String)> = abs_externs
++            .iter()
++            .zip(extern_hashes.iter())
++            .map(|(p, h)| (p.display().to_string(), h.clone()))
++            .collect();
++
+         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
+         let mut m = Digest::new();
+         // Hash inputs:
+@@ -1714,6 +1729,54 @@
              ));
          }
  
@@ -58,11 +77,11 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
 +                    out.push_str(&format!("shlib\t{}\n", d));
 +                }
 +                out.push_str(&format!("args\t{}\n", args.to_string_lossy()));
-+                for (p, h) in source_files.iter().zip(source_hashes.iter()) {
-+                    out.push_str(&format!("src\t{}\t{}\n", p.display(), h));
++                for (p, h) in &dump_src_pairs {
++                    out.push_str(&format!("src\t{}\t{}\n", p, h));
 +                }
-+                for (p, h) in abs_externs.iter().zip(extern_hashes.iter()) {
-+                    out.push_str(&format!("extern\t{}\t{}\n", p.display(), h));
++                for (p, h) in &dump_extern_pairs {
++                    out.push_str(&format!("extern\t{}\t{}\n", p, h));
 +                }
 +                for (var, val) in env_deps.iter() {
 +                    out.push_str(&format!(
@@ -98,7 +117,7 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
          let inputs = source_files
              .into_iter()
              .chain(abs_externs)
-@@ -1721,7 +1772,7 @@
+@@ -1721,7 +1784,7 @@
              .collect();
  
          Ok(HashResult {
