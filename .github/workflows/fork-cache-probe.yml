@@ -137,6 +137,8 @@ jobs:
             cargo --config .cargo/bundle-config.toml build -v --release --package $crate --target x86_64-pc-windows-msvc 2>&1 |
               Tee-Object -FilePath (Join-Path $ws "probe-pass$i.log") | Select-Object -Last 3
             Get-DllFingerprint | Set-Content (Join-Path $ws "dll-hash-pass$i.txt")
+            $pm = Get-ChildItem "target/release/deps" -Filter "*gpui_macros*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($pm) { Copy-Item $pm.FullName (Join-Path $ws "dll-pass$i.bin") -Force }
             $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
             $h1 = 0; $r1 = 0; $m1 = 0
             if ($stats -match "Cache hits \(Rust\)\s+(\d+)") { $h1 = [int]$Matches[1] }
@@ -147,7 +149,13 @@ jobs:
             Write-Host "===== PASS $i result: units=$units hits=$hits misses=$($units-$hits) ====="
             "pass${i}: units=$units hits=$hits" | Add-Content (Join-Path $ws "probe-summary.txt")
           }
+          # Hard evidence that /Brepro reached the proc-macro (host artifact)
+          # rustc argv: the sccache server sees the final expanded args.
           Copy-Item D:\a\_temp\sccache-server.log (Join-Path $ws "sccache-server.log") -ErrorAction SilentlyContinue
+          $srv = Get-Content (Join-Path $ws "sccache-server.log") -Raw
+          $breproOnHost = $srv -match "gpui_macros[^\r\n]*Brepro"
+          Write-Host "===== HOST-FLAG ASSERT: /Brepro on gpui_macros argv = $breproOnHost ====="
+          "brepro_on_host=$breproOnHost" | Add-Content (Join-Path $ws "probe-summary.txt")
 
       - name: Upload probe logs
         if: always()
@@ -159,4 +167,5 @@ jobs:
             probe-summary.txt
             sccache-server.log
             dll-hash-pass*.txt
+            dll-pass*.bin
           if-no-files-found: warn
