@@ -23,6 +23,9 @@ rustflags = [
 # host_artifact_uses_only_host_config) rules out every rustflags channel
 # on stable: with --target, host artifacts read ONLY the nightly-gated
 # [host] table and fall through to EMPTY — RUSTFLAGS env, [target.*] and
-# [build] are all unreachable for them. The working channel is the native
-# MSVC LINK environment variable, which link.exe prepends to its options
-# for every invocation rustc makes; it is set on the workflow job.
+# [build] are all unreachable for them. Linker options are no fix either:
+# /Brepro hashes its inputs including rustc's per-invocation random temp
+# paths (dll still varies), and /TIMESTAMP:0 via the MSVC LINK env var is
+# silently ignored. The fix lives in the forked sccache instead: it zeroes
+# these PE bytes before hashing --extern files
+# (fork-tools/sccache-extern-pe-normalize.patch, version 0.18.0-fork.1).
