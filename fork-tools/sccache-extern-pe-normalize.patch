@@ -45,8 +45,8 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
              "[{}]: hashing {} staticlibs",
 diff -ruN a/src/util.rs b/src/util.rs
 --- a/src/util.rs	2026-09-21 02:51:04.963377813 +0800
-+++ b/src/util.rs	2026-09-21 03:19:47.943472722 +0800
-@@ -455,6 +455,204 @@
++++ b/src/util.rs	2026-09-21 03:38:44.300084955 +0800
+@@ -455,6 +455,205 @@
      Ok(())
  }
  
@@ -71,8 +71,9 @@ diff -ruN a/src/util.rs b/src/util.rs
 +        let f = f.clone();
 +        let pool = pool.clone();
 +        async move {
++            let f2 = f.clone();
 +            let normalized = pool
-+                .spawn_blocking(move || normalized_extern_image_digest(&f))
++                .spawn_blocking(move || normalized_extern_image_digest(&f2))
 +                .await??;
 +            match normalized {
 +                Some(digest) => Ok(digest),
@@ -251,7 +252,7 @@ diff -ruN a/src/util.rs b/src/util.rs
  /// Format `duration` as seconds with a fractional component.
  pub fn fmt_duration_as_secs(duration: &Duration) -> String {
      format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
-@@ -1530,11 +1728,94 @@
+@@ -1530,11 +1729,94 @@
      executable.to_path_buf()
  }
  
