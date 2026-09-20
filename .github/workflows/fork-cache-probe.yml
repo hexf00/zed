@@ -83,11 +83,15 @@ jobs:
         shell: pwsh
         run: |
           "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
-          "SCCACHE_ERROR_LOG=D:\a\_temp\sccache-server.log" >> $env:GITHUB_ENV
           $sccacheDir = Split-Path $env:SCCACHE_PATH
           "PATH=$sccacheDir;$env:PATH" >> $env:GITHUB_ENV
           "CC=sccache cl" >> $env:GITHUB_ENV
           "CXX=sccache cl" >> $env:GITHUB_ENV
+          # Inline (not GITHUB_ENV): the server must be started with these
+          # already in its environment - GITHUB_ENV only affects later
+          # steps, and the server lives across steps.
+          $env:SCCACHE_ERROR_LOG = "D:\a\_temp\sccache-server.log"
+          $env:SCCACHE_LOG = "debug"
           & $env:SCCACHE_PATH --stop-server 2>$null
           & $env:SCCACHE_PATH --start-server
 
