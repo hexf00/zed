@@ -1,0 +1,96 @@
+# Fork-only toolchain probe: is MSVC /Brepro output deterministic for the
+# rustc link pipeline? Answers, in ~5 minutes, whether the proc-macro dll
+# byte drift can be fixed by flags at all:
+#
+#   C1: link same obj twice            -> expect identical (sanity)
+#   C2: recompile obj (same content, new mtime), link again
+#                                      -> differing == link input hash covers
+#                                         obj timestamp/content drift
+#   C3: same obj with COFF TimeDateStamp patched to 0, link again
+#                                      -> identical to C1 == obj header stamp
+#                                         is the only variance source
+#   R1: rustc --cdylib /Brepro twice   -> identical?
+#   R2: same after touching the source (mtime-only change)
+#                                      -> differing == rustc-produced link
+#                                         inputs carry per-invocation data;
+#                                         no flag can stabilize -> normalize
+#                                         at the sccache layer instead.
+name: Fork Brepro Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-brepro-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: C link determinism
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $ip = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath | Select-Object -First 1
+          & "$ip\Common7\Tools\Launch-VsDevShell.ps1" -Arch x64 -HostArch x64
+          Set-Location $env:GITHUB_WORKSPACE
+          'int f(void){return 42;}' | Set-Content t.c
+          cl /nologo /c t.c /Fo:t1.obj
+          cl /nologo /c t.c /Fo:t2.obj
+          # show obj COFF TimeDateStamp (offset 4, little-endian)
+          foreach ($o in "t1.obj","t2.obj") {
+            $b = [IO.File]::ReadAllBytes($o)
+            $ts = [BitConverter]::ToUInt32($b, 4)
+            Write-Host "OBJ-STAMP $o = $ts (unix)"
+          }
+          link /nologo /DLL /Brepro /OUT:c1.dll t1.obj
+          link /nologo /DLL /Brepro /OUT:c2.dll t1.obj
+          link /nologo /DLL /Brepro /OUT:c3.dll t2.obj
+          $b = [IO.File]::ReadAllBytes("t1.obj"); $b[4]=0; $b[5]=0; $b[6]=0; $b[7]=0
+          [IO.File]::WriteAllBytes("t1p.obj", $b)
+          link /nologo /DLL /Brepro /OUT:c4.dll t1p.obj
+          Get-FileHash c*.dll -Algorithm SHA256 | Sort-Object Path |
+            ForEach-Object { "C {0} {1}" -f (Split-Path $_.Path -Leaf), $_.Hash } | Tee-Object c-verdict.txt
+          $h = @{}
+          Get-FileHash c*.dll -Algorithm SHA256 | ForEach-Object { $h[(Split-Path $_.Path -Leaf)] = $_.Hash }
+          Write-Host ("C-VERDICT same-obj-relink stable: " + ($h['c1.dll'] -eq $h['c2.dll']))
+          Write-Host ("C-VERDICT fresh-obj stable:       " + ($h['c1.dll'] -eq $h['c3.dll']))
+          Write-Host ("C-VERDICT ts-patched stable:      " + ($h['c1.dll'] -eq $h['c4.dll']))
+
+      - name: rustc cdylib determinism
+        shell: pwsh
+        run: |
+          Set-Location $env:GITHUB_WORKSPACE
+          'pub fn f() -> i32 { 42 }' | Set-Content lib.rs -NoNewline
+          rustc --crate-type=cdylib -C link-arg=/Brepro --edition=2021 lib.rs -o r1.dll 2>$null
+          rustc --crate-type=cdylib -C link-arg=/Brepro --edition=2021 lib.rs -o r2.dll 2>$null
+          (Get-Content lib.rs -Raw) | Set-Content lib.rs -NoNewline
+          rustc --crate-type=cdylib -C link-arg=/Brepro --edition=2021 lib.rs -o r3.dll 2>$null
+          Get-FileHash r*.dll -Algorithm SHA256 | Sort-Object Path |
+            ForEach-Object { "R {0} {1}" -f (Split-Path $_.Path -Leaf), $_.Hash } | Tee-Object r-verdict.txt
+          $h = @{}
+          Get-FileHash r*.dll -Algorithm SHA256 | ForEach-Object { $h[(Split-Path $_.Path -Leaf)] = $_.Hash }
+          Write-Host ("R-VERDICT no-touch stable: " + ($h['r1.dll'] -eq $h['r2.dll']))
+          Write-Host ("R-VERDICT touch stable:    " + ($h['r1.dll'] -eq $h['r3.dll']))
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brepro-evidence
+          path: |
+            c-verdict.txt
+            r-verdict.txt
+            c1.dll
+            c3.dll
+            c4.dll
+            r1.dll
+            r3.dll
+          if-no-files-found: warn
