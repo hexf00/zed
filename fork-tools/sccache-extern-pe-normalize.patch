@@ -128,8 +128,8 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
                  host: self.host.clone(),
 diff -ruN a/src/util.rs b/src/util.rs
 --- a/src/util.rs	2026-09-21 02:51:04.963377813 +0800
-+++ b/src/util.rs	2026-09-21 03:48:32.716628003 +0800
-@@ -455,6 +455,205 @@
++++ b/src/util.rs	2026-09-21 06:27:51.156377901 +0800
+@@ -455,6 +455,213 @@
      Ok(())
  }
  
@@ -182,10 +182,18 @@ diff -ruN a/src/util.rs b/src/util.rs
 +    if file.read_exact(&mut magic).is_err() || &magic != b"MZ" {
 +        return Ok(None);
 +    }
++    // rewind: read_exact above consumed the magic bytes, and the normalizer
++    // needs the WHOLE image with original offsets.
++    file.rewind()
++        .with_context(|| format!("Failed to rewind file for hashing: {:?}", path))?;
 +    let mut data = Vec::new();
 +    file.read_to_end(&mut data)
 +        .with_context(|| format!("Failed to read file for hashing: {:?}", path))?;
-+    if normalize_pe_volatile_bytes(&mut data).is_err() {
++    if let Err(e) = normalize_pe_volatile_bytes(&mut data) {
++        debug!(
++            "[extern PE normalize failed on {:?}, falling back to raw digest: {}]",
++            path, e
++        );
 +        return Ok(None);
 +    }
 +    let mut digest = Digest::new();
@@ -335,7 +343,7 @@ diff -ruN a/src/util.rs b/src/util.rs
  /// Format `duration` as seconds with a fractional component.
  pub fn fmt_duration_as_secs(duration: &Duration) -> String {
      format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
-@@ -1530,11 +1729,96 @@
+@@ -1530,11 +1737,96 @@
      executable.to_path_buf()
  }
  
