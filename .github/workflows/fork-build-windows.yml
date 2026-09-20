@@ -19,6 +19,13 @@ on:
         options:
           - x86_64
           - aarch64
+      expect_warm_cache:
+        description: Fail fast when Rust/C hit rates miss threshold (false = bank run)
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
   # Manual-only by design: cold/warm builds are hours long, so nothing
   # triggers them implicitly. Public repos get free unlimited Actions
   # minutes; the only cap is 6h per job (timeout below leaves headroom).
@@ -182,6 +189,29 @@ jobs:
           "CC=sccache cl" >> $env:GITHUB_ENV
           "CXX=sccache cl" >> $env:GITHUB_ENV
 
+          # C canary: prove sccache can cache cl.exe in ~1min, before
+          # burning an hour on a full build. Same file compiled twice -
+          # the second compile must be a cache hit.
+          & "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch x64 -HostArch x64
+          Set-Content (Join-Path $dir "ping.c") 'int ping3(void){return 3;}'
+          function Get-CHits {
+            $s = (& $env:SCCACHE_PATH --show-stats) | Out-String
+            if ($s -match "Cache hits \(C/C\+\+\)\s+(\d+)") { return [int]$Matches[1] }
+            return -1
+          }
+          $h0 = Get-CHits
+          Push-Location $dir
+          & $env:SCCACHE_PATH cl /nologo /c ping.c 2>&1 | Select-Object -Last 1
+          $h1 = Get-CHits
+          & $env:SCCACHE_PATH cl /nologo /c ping.c 2>&1 | Select-Object -Last 1
+          Pop-Location
+          $h2 = Get-CHits
+          Write-Host "== C canary: hits $h0 -> $h1 -> $h2"
+          if ($h2 -le $h1) {
+            & $env:SCCACHE_PATH --show-stats
+            throw "sccache cannot cache cl.exe output (C hits $h0 -> $h1 -> $h2). Native caching is broken."
+          }
+
       - name: Prewarm sccache (pure pull pass)
         # Pass 1 with the bundle script's exact command and env: on a warm
         # store every unit is a sccache hit, so this phase is a pure
@@ -200,6 +230,29 @@ jobs:
           rustup target add x86_64-pc-windows-msvc
           cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --package auto_update_helper --target x86_64-pc-windows-msvc
           cargo --config .cargo/bundle-config.toml build --release --package explorer_command_injector --target x86_64-pc-windows-msvc
+
+      - name: Cache gate (fast fail)
+        # Live verdict: this step's conclusion and its failure annotation
+        # are visible via the API while the run continues - no need to
+        # wait for job logs (Windows logs appear only after completion).
+        # expect_warm_cache=false turns this into an advisory print for
+        # bank runs.
+        shell: pwsh
+        run: |
+          $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
+          Write-Host $stats
+          $stats | Add-Content $env:GITHUB_STEP_SUMMARY
+          $rustHit = 0.0; $cHit = 0.0; $cReq = 0
+          if ($stats -match "Cache hits rate \(Rust\)\s+([\d.]+) %") { $rustHit = [double]$Matches[1] }
+          if ($stats -match "(Compile|Cache) requests \(C/C\+\+\)\s+(\d+)") { $cReq = [int]$Matches[2] }
+          if ($stats -match "Cache hits rate \(C/C\+\+\)\s+([\d.]+) %") { $cHit = [double]$Matches[1] }
+          if ("${{ inputs.expect_warm_cache }}" -ne "true") {
+            Write-Host "bank run - gate advisory only (rust=$rustHit%, c=$cHit% of $cReq)"
+            exit 0
+          }
+          if ($rustHit -lt 60) { throw "Rust hit rate ${rustHit}% < 60% - cache not effective" }
+          if ($cReq -gt 50 -and $cHit -lt 50) { throw "C/C++ hit rate ${cHit}% < 50% over $cReq requests - native cache not effective" }
+          Write-Host "cache gate OK (rust=${rustHit}%, c=${cHit}% of $cReq)"
 
       - name: Bundle Windows
         shell: pwsh
