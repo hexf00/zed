@@ -13,3 +13,12 @@ rustflags = [
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=/Brepro",
 ]
+
+# Proc-macros and build scripts are HOST artifacts under --target: the
+# target section above never applies to them, so their dll/exe kept a
+# wall-clock PE timestamp and every relink produced different bytes.
+# Every crate that --extern's a proc-macro dll then got a fresh sccache
+# key each run (~250 first-party crates). /Brepro zeroes that timestamp;
+# nothing else from the target section is forced onto host artifacts.
+[host]
+rustflags = ["-C", "link-arg=/Brepro"]
