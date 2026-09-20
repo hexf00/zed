@@ -121,7 +121,7 @@ jobs:
             $units = $r1 - $r0
             $hits = $h1 - $h0
             Write-Host "===== PASS $i result: units=$units hits=$hits misses=$($units-$hits) ====="
-            "pass$i: units=$units hits=$hits" | Add-Content probe-summary.txt
+            "pass${i}: units=$units hits=$hits" | Add-Content probe-summary.txt
           }
 
       - name: Upload probe logs
