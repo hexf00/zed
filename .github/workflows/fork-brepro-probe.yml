@@ -79,12 +79,12 @@ jobs:
           (Get-Content lib.rs -Raw) | Set-Content lib.rs -NoNewline
           Invoke-RustC r3.dll
           # obj-only emission: does the rustc OBJECT itself vary per invocation?
-          rustc --emit=obj --edition=2021 lib.rs -o o1.obj
+          rustc --crate-type=cdylib --emit=obj --edition=2021 lib.rs -o o1.obj
           if ($LASTEXITCODE -ne 0) { throw "rustc obj1 failed" }
           $ob = [IO.File]::ReadAllBytes("o1.obj")
           Write-Host ("OBJ-STAMP o1.obj = " + [BitConverter]::ToUInt32($ob, 4))
           (Get-Content lib.rs -Raw) | Set-Content lib.rs -NoNewline
-          rustc --emit=obj --edition=2021 lib.rs -o o2.obj
+          rustc --crate-type=cdylib --emit=obj --edition=2021 lib.rs -o o2.obj
           if ($LASTEXITCODE -ne 0) { throw "rustc obj2 failed" }
           $h = @{}
           Get-FileHash r*.dll, o*.obj -Algorithm SHA256 | Sort-Object Path |
