@@ -2,4 +2,7 @@
 RUSTC_BOOTSTRAP = "1"
 
 [build]
-rustflags = ["-Z", "share-generics=y"]
+# /Brepro: deterministic PE output (link.exe otherwise embeds the current
+# timestamp), so proc-macro dlls are byte-identical across runs and
+# sccache keys of everything downstream stay stable.
+rustflags = ["-Z", "share-generics=y", "-C", "link-arg=/Brepro"]
