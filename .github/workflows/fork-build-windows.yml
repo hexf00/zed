@@ -112,7 +112,12 @@ jobs:
         # v0.0.11 exports the cache-service env that modern sccache GHA
         # backends require (v0.0.9 + pinned sccache 0.9.x failed server
         # startup with "ACTIONS_CACHE_URL not found").
+        # version pinned: sccache scopes its GHA entries by its own
+        # version, so an unpinned "latest" would silently invalidate the
+        # entire cache whenever upstream releases.
         uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
