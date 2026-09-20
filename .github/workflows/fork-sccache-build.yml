@@ -1,0 +1,74 @@
+# Fork-only: build a patched sccache and store the binary in the GHA cache.
+#
+# Upstream sccache hashes `--extern` files byte-exact. MSVC-linked proc-macro
+# dlls carry link-time metadata that changes on every link even for identical
+# inputs (COFF/debug/export timestamps, RSDS GUID + PDB age, REPRO hashes),
+# so ~250 first-party crates got a fresh sccache key every build. The patch
+# (fork-tools/sccache-extern-pe-normalize.patch) zeroes those bytes before
+# hashing and bumps CACHE_VERSION + package version (0.18.0-fork.1).
+#
+# Rerun manually after touching the patch; the prod/probe workflows restore
+# the binary from the same cache key and fail fast on a miss.
+name: Fork sccache build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-sccache-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout (patch file)
+        uses: actions/checkout@v5
+
+      - name: Fetch and patch sccache v0.18.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSfL https://github.com/mozilla/sccache/archive/refs/tags/v0.18.0.tar.gz -o src.tgz
+          tar xzf src.tgz --strip-components=1
+          patch -p1 < fork-tools/sccache-extern-pe-normalize.patch
+          grep -q '0.18.0-fork.1' Cargo.toml
+          grep -q 'hash_all_externs' src/compiler/rust.rs
+
+      - name: Unit tests (PE normalization)
+        shell: bash
+        run: cargo test --lib -- normalize_pe_volatile
+
+      - name: Build
+        shell: bash
+        run: cargo build --release
+        env:
+          CARGO_BUILD_JOBS: "4"
+
+      - name: Stage binary
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "sccache-fork"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item target/release/sccache.exe (Join-Path $out "sccache.exe") -Force
+          $v = & (Join-Path $out "sccache.exe") --version
+          Write-Host "sccache version: $v"
+          if ("$v" -notlike "*0.18.0-fork.1*") { throw "unexpected sccache version: $v" }
+
+      - name: Cache binary
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sccache-fork
+          key: sccache-fork-0.18.0-fork.1-${{ hashFiles('fork-tools/*.patch') }}
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-fork-0.18.0-fork.1
+          path: ${{ runner.temp }}/sccache-fork/sccache.exe
+          if-no-files-found: error

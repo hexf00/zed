@@ -124,6 +124,30 @@ jobs:
         with:
           version: "v0.18.0"
 
+      - name: Restore fork sccache
+        uses: actions/cache@v4
+        id: fork-sccache
+        with:
+          path: ${{ runner.temp }}/sccache-fork
+          key: sccache-fork-0.18.0-fork.1-${{ hashFiles('fork-tools/*.patch') }}
+
+      - name: Install fork sccache
+        # Overwrite the action-downloaded binary before the server starts.
+        # The fork zeroes link-time-volatile PE bytes (COFF/debug/export
+        # timestamps, RSDS GUID + PDB age, REPRO hashes) when hashing
+        # --extern files, so downstream first-party keys stay stable across
+        # builds even though proc-macro dlls are re-linked every run.
+        shell: pwsh
+        run: |
+          $bin = Join-Path $env:RUNNER_TEMP "sccache-fork\sccache.exe"
+          if (-not (Test-Path $bin)) {
+            throw "fork sccache binary not in GHA cache - dispatch 'Fork sccache build' once, then rerun"
+          }
+          Copy-Item $bin $env:SCCACHE_PATH -Force
+          $v = & $env:SCCACHE_PATH --version
+          Write-Host "active sccache: $v"
+          if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: $v" }
+
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
         # ...\2022\Community path. Locate the real VS installation with
