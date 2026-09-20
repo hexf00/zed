@@ -49,6 +49,9 @@ jobs:
     timeout-minutes: 350
     env:
       CARGO_INCREMENTAL: "0"
+      # Per-request server log: decomposes pull time (hash vs GHA fetch)
+      # into SCCACHE_ERROR_LOG, uploaded as an artifact for analysis.
+      SCCACHE_LOG: "debug"
       # Concurrent cache pulls: every replay hit is a sccache lookup driven
       # by cargo's job count, so 16 jobs pull the store 16-way instead of
       # 4-way (~1min for the full store on warm runs). Real compiles are
@@ -82,6 +85,8 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.9.1"
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
@@ -224,11 +229,14 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
+          "PREWARM_START=$(Get-Date -Format o)" >> $env:GITHUB_ENV
           & "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch x64 -HostArch x64
           $env:ZED_RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
           $env:RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
           rustup target add x86_64-pc-windows-msvc
-          cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --package auto_update_helper --target x86_64-pc-windows-msvc
+          cargo --config .cargo/bundle-config.toml build --timings --release --package zed --package cli --package auto_update_helper --target x86_64-pc-windows-msvc
+          Get-ChildItem target -Recurse -Filter cargo-timing.html |
+            ForEach-Object { Copy-Item $_.FullName ($_.FullName -replace 'cargo-timing\.html', 'cargo-timing-pass1.html') }
           cargo --config .cargo/bundle-config.toml build --release --package explorer_command_injector --target x86_64-pc-windows-msvc
 
       - name: Cache gate (fast fail)
@@ -250,6 +258,11 @@ jobs:
             Write-Host "bank run - gate advisory only (rust=$rustHit%, c=$cHit% of $cReq)"
             exit 0
           }
+          if ($env:PREWARM_START) {
+            $pullMin = [math]::Round(((Get-Date) - (Get-Date $env:PREWARM_START)).TotalMinutes, 1)
+            if ($pullMin -gt 15) { throw "prewarm pull took ${pullMin}min (>15) - pull path too slow, see sccache server log artifact" }
+            Write-Host "prewarm wall: ${pullMin}min"
+          }
           if ($rustHit -lt 60) { throw "Rust hit rate ${rustHit}% < 60% - cache not effective" }
           if ($cReq -gt 50 -and $cHit -lt 50) { throw "C/C++ hit rate ${cHit}% < 50% over $cReq requests - native cache not effective" }
           Write-Host "cache gate OK (rust=${rustHit}%, c=${cHit}% of $cReq)"
@@ -266,7 +279,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cargo-timings
-          path: target/**/cargo-timings/cargo-timing.html
+          path: target/**/cargo-timings/*.html
           if-no-files-found: ignore
 
       - name: Show sccache stats
