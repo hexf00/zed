@@ -39,6 +39,16 @@ jobs:
           grep -q '0.18.0-fork.1' Cargo.toml
           grep -q 'hash_all_externs' src/compiler/rust.rs
 
+      - name: Pin toolchain
+        # sccache v0.18.0's own lib (String + &String arithmetic in nvcc.rs /
+        # rust.rs) no longer compiles on the runners' current stable; pin the
+        # MSRV-era toolchain upstream released with instead of patching
+        # upstream code. Edition 2024 requires >= 1.85.
+        shell: bash
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup override set 1.85.0
+
       - name: Unit tests (PE normalization)
         shell: bash
         run: cargo test --lib -- normalize_pe_volatile
