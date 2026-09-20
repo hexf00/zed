@@ -232,4 +232,3 @@ jobs:
             dll-pass*.bin
             keydump/**
           if-no-files-found: warn
-          if-no-files-found: warn
