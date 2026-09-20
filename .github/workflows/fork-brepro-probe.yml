@@ -68,17 +68,34 @@ jobs:
         shell: pwsh
         run: |
           Set-Location $env:GITHUB_WORKSPACE
-          'pub fn f() -> i32 { 42 }' | Set-Content lib.rs -NoNewline
-          rustc --crate-type=cdylib -C link-arg=/Brepro --edition=2021 lib.rs -o r1.dll 2>$null
-          rustc --crate-type=cdylib -C link-arg=/Brepro --edition=2021 lib.rs -o r2.dll 2>$null
+          ' #[no_mangle] pub extern "C" fn f() -> i32 { 42 } ' | Set-Content lib.rs -NoNewline
+          function Invoke-RustC($out) {
+            rustc --crate-type=cdylib -C link-arg=/Brepro --edition=2021 lib.rs -o $out
+            if ($LASTEXITCODE -ne 0) { throw "rustc failed for $out" }
+            if (-not (Test-Path $out)) { throw "$out missing after rustc" }
+          }
+          Invoke-RustC r1.dll
+          Invoke-RustC r2.dll
           (Get-Content lib.rs -Raw) | Set-Content lib.rs -NoNewline
-          rustc --crate-type=cdylib -C link-arg=/Brepro --edition=2021 lib.rs -o r3.dll 2>$null
-          Get-FileHash r*.dll -Algorithm SHA256 | Sort-Object Path |
-            ForEach-Object { "R {0} {1}" -f (Split-Path $_.Path -Leaf), $_.Hash } | Tee-Object r-verdict.txt
+          Invoke-RustC r3.dll
+          # obj-only emission: does the rustc OBJECT itself vary per invocation?
+          rustc --emit=obj --edition=2021 lib.rs -o o1.obj
+          if ($LASTEXITCODE -ne 0) { throw "rustc obj1 failed" }
+          $ob = [IO.File]::ReadAllBytes("o1.obj")
+          Write-Host ("OBJ-STAMP o1.obj = " + [BitConverter]::ToUInt32($ob, 4))
+          (Get-Content lib.rs -Raw) | Set-Content lib.rs -NoNewline
+          rustc --emit=obj --edition=2021 lib.rs -o o2.obj
+          if ($LASTEXITCODE -ne 0) { throw "rustc obj2 failed" }
           $h = @{}
-          Get-FileHash r*.dll -Algorithm SHA256 | ForEach-Object { $h[(Split-Path $_.Path -Leaf)] = $_.Hash }
+          Get-FileHash r*.dll, o*.obj -Algorithm SHA256 | Sort-Object Path |
+            ForEach-Object { $n = Split-Path $_.Path -Leaf; $h[$n] = $_.Hash; "R $n $($_.Hash)" } |
+            Tee-Object r-verdict.txt
+          foreach ($k in "r1.dll","r2.dll","r3.dll","o1.obj","o2.obj") {
+            if (-not $h.ContainsKey($k)) { throw "missing evidence file $k" }
+          }
           Write-Host ("R-VERDICT no-touch stable: " + ($h['r1.dll'] -eq $h['r2.dll']))
           Write-Host ("R-VERDICT touch stable:    " + ($h['r1.dll'] -eq $h['r3.dll']))
+          Write-Host ("R-VERDICT obj no-touch:    " + ($h['o1.obj'] -eq $h['o2.obj']))
 
       - name: Upload evidence
         if: always()
@@ -93,4 +110,6 @@ jobs:
             c4.dll
             r1.dll
             r3.dll
+            o1.obj
+            o2.obj
           if-no-files-found: warn
