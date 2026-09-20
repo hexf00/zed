@@ -104,11 +104,18 @@ jobs:
           rustup target add x86_64-pc-windows-msvc 2>&1 | Out-Null
           $crate = "${{ inputs.crate }}"
           $passes = [int]("${{ inputs.runs }}")
+          function Get-DllFingerprint {
+            $d = "target/x86_64-pc-windows-msvc/release/deps"
+            Get-ChildItem $d -Filter *.dll -ErrorAction SilentlyContinue | Sort-Object Name |
+              ForEach-Object { "{0}={1}" -f $_.Name, (Get-FileHash $_.Name -Algorithm SHA256).Hash }
+          }
           for ($i = 1; $i -le $passes; $i++) {
             if ($i -gt 1) {
               # same content, new mtime: forces cargo to re-invoke rustc
               (Get-Content "crates/$crate/src/lib.rs" -Raw) |
                 Set-Content "crates/$crate/src/lib.rs" -NoNewline
+              (Get-Content "crates/gpui_macros/src/gpui_macros.rs" -Raw) |
+                Set-Content "crates/gpui_macros/src/gpui_macros.rs" -NoNewline
             }
             $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
             $h0 = 0; $r0 = 0
@@ -117,6 +124,7 @@ jobs:
             Write-Host "===== PASS $i (before: requests=$r0 rustHits=$h0) ====="
             cargo --config .cargo/bundle-config.toml build -v --release --package $crate --target x86_64-pc-windows-msvc 2>&1 |
               Tee-Object -FilePath "probe-pass$i.log" | Select-Object -Last 3
+            Get-DllFingerprint | Set-Content "dll-hash-pass$i.txt"
             $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
             $h1 = 0; $r1 = 0; $m1 = 0
             if ($stats -match "Cache hits \(Rust\)\s+(\d+)") { $h1 = [int]$Matches[1] }
