@@ -171,18 +171,32 @@ jobs:
           }
           Write-Host "sccache canary OK (absolute=$abs, pinned=$pinned, real=$real)"
 
+          # Cache native C/C++ builds too: -sys crates' build scripts
+          # invoke cl.exe directly, which RUSTC_WRAPPER never sees, so
+          # those ~242 crates rebuilt from scratch every run (~60min).
+          # cc-rs honors CC/CXX; sccache forwards to cl.exe. Requires the
+          # VsDevShell environment (INCLUDE/LIB), which both the prewarm
+          # pass and the bundle build provide.
+          $sccacheDir = Split-Path $env:SCCACHE_PATH
+          "PATH=$sccacheDir;$env:PATH" >> $env:GITHUB_ENV
+          "CC=sccache cl" >> $env:GITHUB_ENV
+          "CXX=sccache cl" >> $env:GITHUB_ENV
+
       - name: Prewarm sccache (pure pull pass)
         # Pass 1 with the bundle script's exact command and env: on a warm
         # store every unit is a sccache hit, so this phase is a pure
         # 16-way concurrent pull of the whole store and compiles nothing;
-        # pass 2 (Bundle Windows) then finds everything fresh. Optimization
-        # only - a failure here must not kill the build.
+        # pass 2 (Bundle Windows) then finds everything fresh. The
+        # VsDevShell launch is REQUIRED for parity: cc-rs build-script
+        # fingerprints depend on the MSVC environment, and a bare shell
+        # makes pass 2 distrust every native product of pass 1.
+        # Optimization only - a failure here must not kill the build.
         continue-on-error: true
         shell: pwsh
         run: |
-          $channel = (Get-Content crates/zed/RELEASE_CHANNEL -Raw).Trim()
-          $env:ZED_RELEASE_CHANNEL = $channel
-          $env:RELEASE_CHANNEL = $channel
+          & "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch x64 -HostArch x64
+          $env:ZED_RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
+          $env:RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
           rustup target add x86_64-pc-windows-msvc
           cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --package auto_update_helper --target x86_64-pc-windows-msvc
           cargo --config .cargo/bundle-config.toml build --release --package explorer_command_injector --target x86_64-pc-windows-msvc
