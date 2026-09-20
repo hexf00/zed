@@ -97,9 +97,11 @@ jobs:
             throw "fork sccache binary not in GHA cache - dispatch 'Fork sccache build' once, then rerun"
           }
           Copy-Item $bin $env:SCCACHE_PATH -Force
-          $v = & $env:SCCACHE_PATH --version
+          # SCCACHE_PATH is extensionless ("...\x64/sccache"); invoke through
+          # cmd so Windows runs it as a PE instead of pwsh's path resolution.
+          $v = cmd /c "`"$env:SCCACHE_PATH`" --version" 2>&1
           Write-Host "active sccache: $v"
-          if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: $v" }
+          if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: '$v'" }
 
       - name: Alias VS Community to Enterprise
         shell: pwsh
