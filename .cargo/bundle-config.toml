@@ -1,8 +1,15 @@
 [env]
 RUSTC_BOOTSTRAP = "1"
 
-[build]
-# /Brepro: deterministic PE output (link.exe otherwise embeds the current
-# timestamp), so proc-macro dlls are byte-identical across runs and
-# sccache keys of everything downstream stay stable.
-rustflags = ["-Z", "share-generics=y", "-C", "link-arg=/Brepro"]
+# NOTE: [build] rustflags is DEAD here — .cargo/config.toml sets
+# [target.'cfg(target_os = "windows")'] rustflags, and cargo rules say
+# target rustflags fully override build rustflags. All Windows rustflags
+# therefore live in the target section below (highest priority via
+# --config), carrying upstream's flags plus the fork additions.
+[target.'cfg(target_os = "windows")']
+rustflags = [
+    "-Z", "share-generics=y",
+    "--cfg", "windows_slim_errors",
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=/Brepro",
+]
