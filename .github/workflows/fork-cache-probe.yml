@@ -47,6 +47,13 @@ jobs:
       # Match production: at debug=0 the PE has no debug directory/PDB GUID,
       # isolating PE-timestamp variance from debug-info variance.
       CARGO_PROFILE_RELEASE_DEBUG: "0"
+      # link.exe reads the LINK env var and prepends it to its options for
+      # EVERY invocation (host artifacts included). With --target, cargo on
+      # stable gives host artifacts (proc-macros/build scripts) NO rustflags
+      # at all, so /Brepro cannot reach their links through rustflags — the
+      # env var is the only channel. This pins the COFF/debug-dir timestamps
+      # that otherwise change every relink and poison downstream sccache keys.
+      LINK: "/Brepro"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -149,16 +156,11 @@ jobs:
             Write-Host "===== PASS $i result: units=$units hits=$hits misses=$($units-$hits) ====="
             "pass${i}: units=$units hits=$hits" | Add-Content (Join-Path $ws "probe-summary.txt")
           }
-          # Hard evidence that /Brepro reached the proc-macro (host artifact)
-          # rustc argv: match the gpui_macros OWN rustc command line only.
-          # A bare "gpui_macros.*Brepro" regex false-positives on target
-          # crates whose argv has --extern gpui_macros=... plus /Brepro.
-          Copy-Item D:\a\_temp\sccache-server.log (Join-Path $ws "sccache-server.log") -ErrorAction SilentlyContinue
-          $own = Select-String -Path (Join-Path $ws "probe-pass3.log") -Pattern '--crate-name gpui_macros ' |
-            Select-Object -First 1
-          $breproOnHost = ($own -ne $null) -and ($own.Line -match 'Brepro')
-          Write-Host "===== HOST-FLAG ASSERT: /Brepro on gpui_macros own argv = $breproOnHost ====="
-          "brepro_on_host=$breproOnHost" | Add-Content (Join-Path $ws "probe-summary.txt")
+          # The flag now rides into link.exe via the LINK env var (not the
+          # rustc argv), so the verdict is purely the dll hash stability
+          # across passes: same bytes pass-to-pass == downstream keys stable.
+          Write-Host "===== LINK env in build step = $env:LINK ====="
+          "link_env=$env:LINK" | Add-Content (Join-Path $ws "probe-summary.txt")
 
       - name: Upload probe logs
         if: always()
