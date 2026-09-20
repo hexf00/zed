@@ -123,6 +123,7 @@ jobs:
             Write-Host "===== PASS $i result: units=$units hits=$hits misses=$($units-$hits) ====="
             "pass${i}: units=$units hits=$hits" | Add-Content probe-summary.txt
           }
+          Copy-Item D:\a\_temp\sccache-server.log .\sccache-server.log -ErrorAction SilentlyContinue
 
       - name: Upload probe logs
         if: always()
@@ -132,5 +133,5 @@ jobs:
           path: |
             probe-pass*.log
             probe-summary.txt
-            D:\a\_temp\sccache-server.log
+            sccache-server.log
           if-no-files-found: warn
