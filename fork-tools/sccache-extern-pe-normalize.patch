@@ -1,6 +1,6 @@
 diff -ruN a/Cargo.toml b/Cargo.toml
 --- a/Cargo.toml	2026-09-21 02:51:04.907375295 +0800
-+++ b/Cargo.toml	2026-09-21 02:54:52.577795274 +0800
++++ b/Cargo.toml	2026-09-21 02:51:25.752312300 +0800
 @@ -3,7 +3,7 @@
  edition = "2024"
  name = "sccache"
@@ -12,7 +12,7 @@ diff -ruN a/Cargo.toml b/Cargo.toml
  description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible. Sccache has the capability to utilize caching in remote storage environments, including various cloud storage options, or alternatively, in local storage."
 diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
 --- a/src/compiler/rust.rs	2026-09-21 02:51:04.951377272 +0800
-+++ b/src/compiler/rust.rs	2026-09-21 02:54:52.593795976 +0800
++++ b/src/compiler/rust.rs	2026-09-21 02:51:25.752312300 +0800
 @@ -235,7 +235,7 @@
      LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
  
@@ -33,7 +33,7 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
              "[{}]: hashing {} staticlibs",
 diff -ruN a/src/util.rs b/src/util.rs
 --- a/src/util.rs	2026-09-21 02:51:04.963377813 +0800
-+++ b/src/util.rs	2026-09-21 02:54:52.601796327 +0800
++++ b/src/util.rs	2026-09-21 03:07:07.889055530 +0800
 @@ -455,6 +455,195 @@
      Ok(())
  }
@@ -323,7 +323,7 @@ diff -ruN a/src/util.rs b/src/util.rs
 +    fn test_normalize_rejects_non_pe() {
 +        let mut data = b"MZ this is not a PE image".to_vec();
 +        assert!(normalize_pe_volatile_bytes(&mut data).is_err());
-+
++    }
  
      #[test]
      fn test_resolve_compiler_avoiding_ccache_filters_path() {
