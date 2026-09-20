@@ -96,10 +96,19 @@ jobs:
           if (-not (Test-Path $bin)) {
             throw "fork sccache binary not in GHA cache - dispatch 'Fork sccache build' once, then rerun"
           }
-          Copy-Item $bin $env:SCCACHE_PATH -Force
-          # SCCACHE_PATH is extensionless ("...\x64/sccache"); invoke through
-          # cmd so Windows runs it as a PE instead of pwsh's path resolution.
-          $v = cmd /c "`"$env:SCCACHE_PATH`" --version" 2>&1
+          Write-Host "restored version: $(cmd /c "`"$bin`" --version" 2>&1)"
+          $srcHash = (Get-FileHash $bin -Algorithm SHA256).Hash
+          Write-Host "restored hash: $srcHash"
+          # SCCACHE_PATH is extensionless ("...\x64/sccache") with mixed
+          # separators; copy via literal path and verify by hash.
+          $dst = $env:SCCACHE_PATH -replace '/', '\'
+          Write-Host "destination: $dst"
+          Copy-Item -LiteralPath $bin -Destination $dst -Force
+          $dstHash = (Get-FileHash $dst -Algorithm SHA256).Hash
+          Write-Host "destination hash: $dstHash"
+          if ($dstHash -ne $srcHash) { throw "fork sccache copy failed (hash mismatch)" }
+          # Extensionless path: invoke through cmd so Windows runs it as PE.
+          $v = cmd /c "`"$dst`" --version" 2>&1
           Write-Host "active sccache: $v"
           if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: '$v'" }
 
