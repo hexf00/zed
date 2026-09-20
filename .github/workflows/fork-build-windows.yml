@@ -99,9 +99,14 @@ jobs:
         # Cargo.lock/toolchain changes; entries stay per-run unique.
         uses: actions/cache/restore@v4
         with:
+          # build scripts and proc-macros are HOST artifacts: with --target
+          # they live in target/release (no triple), NOT the triple dir.
           path: |
+            target/release/build
+            target/release/deps/*.dll
+            target/release/deps/*.exe
+            target/release/.fingerprint
             target/x86_64-pc-windows-msvc/release/build
-            target/x86_64-pc-windows-msvc/release/deps/*.dll
             target/x86_64-pc-windows-msvc/release/.fingerprint
           key: uncacheable-layer-x86_64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
           restore-keys: |
@@ -323,8 +328,11 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
+            target/release/build
+            target/release/deps/*.dll
+            target/release/deps/*.exe
+            target/release/.fingerprint
             target/x86_64-pc-windows-msvc/release/build
-            target/x86_64-pc-windows-msvc/release/deps/*.dll
             target/x86_64-pc-windows-msvc/release/.fingerprint
           key: uncacheable-layer-x86_64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
 

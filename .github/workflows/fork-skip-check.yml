@@ -1,0 +1,66 @@
+# Fork-only: fast validation of SKIP-COMPILATION caching (cargo Fresh
+# semantics), without building Zed. Pass criterion, per requirement:
+# after restoring a persisted target dir, an unchanged rebuild must
+# print NO "Compiling" lines at all - cargo skips the compiler entirely.
+#
+# Method: build a probe project -> tar the target dir -> delete it ->
+# untar back (simulating cross-run restore) -> rebuild -> assert zero
+# "Compiling" lines. ~6 minutes end to end.
+name: Fork Skip-Compile Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-skip-check
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Skip-compile roundtrip assertion
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "skiptest"
+          New-Item -ItemType Directory -Force (Join-Path $dir "src") | Out-Null
+          Set-Content (Join-Path $dir "Cargo.toml") @'
+          [package]
+          name = "skiptest"
+          version = "0.0.0"
+          edition = "2021"
+
+          [dependencies]
+          syn = { version = "2", features = ["full"] }
+          '@
+          Set-Content (Join-Path $dir "src\lib.rs") 'pub fn f() -> usize { syn::__private::to_string_debug(&1).len() }'
+          $manifest = Join-Path $dir "Cargo.toml"
+
+          Write-Host "=== build 1 (populates target) ==="
+          $b1 = cargo build --manifest-path $manifest 2>&1 | Out-String
+          if ($b1 -notmatch "Compiling") { throw "control failed: first build should compile" }
+
+          Write-Host "=== persist + wipe target (simulates cross-run restore) ==="
+          $target = Join-Path $dir "target"
+          tar -czf (Join-Path $dir "target.tgz") -C $dir target
+          $tgzMB = [math]::Round((Get-Item (Join-Path $dir "target.tgz")).Length / 1MB, 1)
+          Write-Host "compressed target snapshot: $tgzMB MB"
+          Remove-Item -Recurse -Force $target
+
+          New-Item -ItemType Directory -Force $target | Out-Null
+          tar -xzf (Join-Path $dir "target.tgz") -C $dir
+
+          Write-Host "=== build 2 (unchanged inputs, restored target): must SKIP compilation ==="
+          $b2 = cargo build --manifest-path $manifest 2>&1 | Out-String
+          Write-Host $b2
+          $compiles = ([regex]::Matches($b2, "Compiling")).Count
+          if ($compiles -ne 0) {
+            throw "FAIL: restored target still triggered $compiles compilations - skip-compile semantics broken"
+          }
+          Write-Host "PASS: zero Compiling lines after restore (skip-compilation cache works, snapshot ${tgzMB} MB)"

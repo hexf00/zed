@@ -105,13 +105,15 @@ jobs:
           $crate = "${{ inputs.crate }}"
           $passes = [int]("${{ inputs.runs }}")
           function Get-DllFingerprint {
-            $d = "target/x86_64-pc-windows-msvc/release/deps"
+            # proc-macros are HOST artifacts: with --target they land in
+            # target/release/deps (no triple), NOT the triple dir.
+            $d = "target/release/deps"
             Get-ChildItem $d -Filter *.dll -ErrorAction SilentlyContinue | Sort-Object Name |
               ForEach-Object { "{0}={1}" -f $_.Name, (Get-FileHash $_.Name -Algorithm SHA256).Hash }
             $pm = Get-ChildItem $d -Filter "*gpui_macros*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($pm) {
               "PROBE {0} sha={1} mtime={2} size={3}" -f $pm.Name, (Get-FileHash $pm.FullName -Algorithm SHA256).Hash, $pm.LastWriteTimeUtc.ToString("o"), $pm.Length
-            } else { "PROBE libgpui_macros*.dll NOT FOUND" }
+            } else { "PROBE gpui_macros dll NOT FOUND in $d" }
           }
           for ($i = 1; $i -le $passes; $i++) {
             if ($i -gt 1) {
