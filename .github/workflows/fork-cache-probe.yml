@@ -150,11 +150,14 @@ jobs:
             "pass${i}: units=$units hits=$hits" | Add-Content (Join-Path $ws "probe-summary.txt")
           }
           # Hard evidence that /Brepro reached the proc-macro (host artifact)
-          # rustc argv: the sccache server sees the final expanded args.
+          # rustc argv: match the gpui_macros OWN rustc command line only.
+          # A bare "gpui_macros.*Brepro" regex false-positives on target
+          # crates whose argv has --extern gpui_macros=... plus /Brepro.
           Copy-Item D:\a\_temp\sccache-server.log (Join-Path $ws "sccache-server.log") -ErrorAction SilentlyContinue
-          $srv = Get-Content (Join-Path $ws "sccache-server.log") -Raw
-          $breproOnHost = $srv -match "gpui_macros[^\r\n]*Brepro"
-          Write-Host "===== HOST-FLAG ASSERT: /Brepro on gpui_macros argv = $breproOnHost ====="
+          $own = Select-String -Path (Join-Path $ws "probe-pass3.log") -Pattern '--crate-name gpui_macros ' |
+            Select-Object -First 1
+          $breproOnHost = ($own -ne $null) -and ($own.Line -match 'Brepro')
+          Write-Host "===== HOST-FLAG ASSERT: /Brepro on gpui_macros own argv = $breproOnHost ====="
           "brepro_on_host=$breproOnHost" | Add-Content (Join-Path $ws "probe-summary.txt")
 
       - name: Upload probe logs

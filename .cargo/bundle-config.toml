@@ -16,9 +16,14 @@ rustflags = [
 
 # Proc-macros and build scripts are HOST artifacts under --target: the
 # target section above never applies to them, so their dll/exe kept a
-# wall-clock PE timestamp and every relink produced different bytes.
-# Every crate that --extern's a proc-macro dll then got a fresh sccache
-# key each run (~250 first-party crates). /Brepro zeroes that timestamp;
-# nothing else from the target section is forced onto host artifacts.
-[host]
+# wall-clock PE timestamp (COFF header + 3 debug-directory entries) and a
+# PDB Age counter, and every relink produced different bytes. Every crate
+# that --extern's a proc-macro dll then got a fresh sccache key each run
+# (~250 first-party crates). The [host] config table is nightly-gated
+# (-Zhost-config) and silently ignored by stable cargo — probed and
+# confirmed. On stable, host artifacts fall through to [build] rustflags
+# when no RUSTFLAGS env is set, and target artifacts are fully shadowed by
+# the target table above — so [build] carrying ONLY /Brepro gives exactly
+# the split we want: host links deterministic, target flags unchanged.
+[build]
 rustflags = ["-C", "link-arg=/Brepro"]
