@@ -1,0 +1,136 @@
+# Fork-only probe: answer "why do first-party crates miss sccache every
+# run" in minutes instead of hours. Builds a tiny first-party crate three
+# times (touch between builds forces rustc re-invocation with identical
+# content), then asserts every pass-2/3 unit is a sccache hit. A miss
+# means the sccache key drifts despite identical inputs; the -v rustc
+# command lines (uploaded as artifacts) contain the differing token.
+#
+# Dispatch once for in-run drift, twice (same commit) for cross-run drift.
+name: Fork Cache Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: First-party crate to probe
+        type: choice
+        default: release_channel
+        options:
+          - release_channel
+          - sqlez_macros
+          - assets
+      runs:
+        description: Number of build passes
+        type: choice
+        default: "3"
+        options:
+          - "2"
+          - "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-cache-probe-${{ inputs.crate }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_IDLE_TIMEOUT: "7200"
+      CARGO_BUILD_JOBS: "16"
+      SCCACHE_LOG: "debug"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-windows-
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Alias VS Community to Enterprise
+        shell: pwsh
+        run: |
+          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+          $launch = "$vsRoot\Community\Common7\Tools\Launch-VsDevShell.ps1"
+          if (-not (Test-Path $launch)) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $installPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath | Select-Object -First 1
+            New-Item -ItemType Directory -Force -Path $vsRoot | Out-Null
+            if (Test-Path "$vsRoot\Community") {
+              Rename-Item "$vsRoot\Community" "Community.incomplete" -Force
+            }
+            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $installPath | Out-Null
+          }
+          Write-Host "VS junction ready"
+
+      - name: Configure sccache + env
+        shell: pwsh
+        run: |
+          "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
+          "SCCACHE_ERROR_LOG=D:\a\_temp\sccache-server.log" >> $env:GITHUB_ENV
+          $sccacheDir = Split-Path $env:SCCACHE_PATH
+          "PATH=$sccacheDir;$env:PATH" >> $env:GITHUB_ENV
+          "CC=sccache cl" >> $env:GITHUB_ENV
+          "CXX=sccache cl" >> $env:GITHUB_ENV
+          & $env:SCCACHE_PATH --stop-server 2>$null
+          & $env:SCCACHE_PATH --start-server
+
+      - name: Probe builds
+        shell: pwsh
+        run: |
+          & "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch x64 -HostArch x64
+          $env:ZED_RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
+          $env:RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
+          rustup target add x86_64-pc-windows-msvc 2>&1 | Out-Null
+          $crate = "${{ inputs.crate }}"
+          $passes = [int]("${{ inputs.runs }}")
+          for ($i = 1; $i -le $passes; $i++) {
+            if ($i -gt 1) {
+              # same content, new mtime: forces cargo to re-invoke rustc
+              (Get-Content "crates/$crate/src/lib.rs" -Raw) |
+                Set-Content "crates/$crate/src/lib.rs" -NoNewline
+            }
+            $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
+            $h0 = 0; $r0 = 0
+            if ($stats -match "Cache hits \(Rust\)\s+(\d+)") { $h0 = [int]$Matches[1] }
+            if ($stats -match "Compile requests\s+(\d+)") { $r0 = [int]$Matches[1] }
+            Write-Host "===== PASS $i (before: requests=$r0 rustHits=$h0) ====="
+            cargo --config .cargo/bundle-config.toml build -v --release --package $crate --target x86_64-pc-windows-msvc 2>&1 |
+              Tee-Object -FilePath "probe-pass$i.log" | Select-Object -Last 3
+            $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
+            $h1 = 0; $r1 = 0; $m1 = 0
+            if ($stats -match "Cache hits \(Rust\)\s+(\d+)") { $h1 = [int]$Matches[1] }
+            if ($stats -match "Compile requests\s+(\d+)") { $r1 = [int]$Matches[1] }
+            if ($stats -match "Cache misses\s+(\d+)") { $m1 = [int]$Matches[1] }
+            $units = $r1 - $r0
+            $hits = $h1 - $h0
+            Write-Host "===== PASS $i result: units=$units hits=$hits misses=$($units-$hits) ====="
+            "pass$i: units=$units hits=$hits" | Add-Content probe-summary.txt
+          }
+
+      - name: Upload probe logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-probe-${{ inputs.crate }}
+          path: |
+            probe-pass*.log
+            probe-summary.txt
+            D:\a\_temp\sccache-server.log
+          if-no-files-found: warn
