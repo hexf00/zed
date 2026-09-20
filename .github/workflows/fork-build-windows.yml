@@ -84,9 +84,10 @@ jobs:
           restore-keys: cargo-registry-windows-
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-        with:
-          version: "v0.9.1"
+        # v0.0.11 exports the cache-service env that modern sccache GHA
+        # backends require (v0.0.9 + pinned sccache 0.9.x failed server
+        # startup with "ACTIONS_CACHE_URL not found").
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
