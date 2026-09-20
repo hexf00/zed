@@ -19,11 +19,10 @@ rustflags = [
 # wall-clock PE timestamp (COFF header + 3 debug-directory entries) and a
 # PDB Age counter, and every relink produced different bytes. Every crate
 # that --extern's a proc-macro dll then got a fresh sccache key each run
-# (~250 first-party crates). The [host] config table is nightly-gated
-# (-Zhost-config) and silently ignored by stable cargo — probed and
-# confirmed. On stable, host artifacts fall through to [build] rustflags
-# when no RUSTFLAGS env is set, and target artifacts are fully shadowed by
-# the target table above — so [build] carrying ONLY /Brepro gives exactly
-# the split we want: host links deterministic, target flags unchanged.
-[build]
-rustflags = ["-C", "link-arg=/Brepro"]
+# (~250 first-party crates). cargo source (extra_args /
+# host_artifact_uses_only_host_config) rules out every rustflags channel
+# on stable: with --target, host artifacts read ONLY the nightly-gated
+# [host] table and fall through to EMPTY — RUSTFLAGS env, [target.*] and
+# [build] are all unreachable for them. The working channel is the native
+# MSVC LINK environment variable, which link.exe prepends to its options
+# for every invocation rustc makes; it is set on the workflow job.
