@@ -208,6 +208,11 @@ jobs:
           # across passes: same bytes pass-to-pass == downstream keys stable.
           Write-Host "===== LINK env in build step = $env:LINK ====="
           "link_env=$env:LINK" | Add-Content (Join-Path $ws "probe-summary.txt")
+          Write-Host "=== serverlog diag ==="
+          Write-Host "exists: $(Test-Path 'D:\a\_temp\sccache-server.log')"
+          Get-ChildItem 'D:\a\_temp' -Filter '*sccache*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "$($_.Name) $($_.Length)" }
+          Copy-Item 'D:\a\_temp\sccache-server.log' (Join-Path $ws 'sccache-server.log') -Force -ErrorAction Continue
 
       - name: Upload probe logs
         if: always()
