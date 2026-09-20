@@ -98,8 +98,11 @@ jobs:
       - name: Probe builds
         shell: pwsh
         run: |
+          $ws = $env:GITHUB_WORKSPACE
           & "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch x64 -HostArch x64
-          $env:ZED_RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
+          # VsDevShell may change cwd; anchor everything to the workspace.
+          Set-Location $ws
+          $env:ZED_RELEASE_CHANNEL = Get-Content (Join-Path $ws "crates/zed/RELEASE_CHANNEL")
           $env:RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
           rustup target add x86_64-pc-windows-msvc 2>&1 | Out-Null
           $crate = "${{ inputs.crate }}"
@@ -109,7 +112,7 @@ jobs:
             # target/release/deps (no triple), NOT the triple dir.
             $d = "target/release/deps"
             Get-ChildItem $d -Filter *.dll -ErrorAction SilentlyContinue | Sort-Object Name |
-              ForEach-Object { "{0}={1}" -f $_.Name, (Get-FileHash $_.Name -Algorithm SHA256).Hash }
+              ForEach-Object { "{0}={1}" -f $_.Name, (Get-FileHash $_.FullName -Algorithm SHA256).Hash }
             $pm = Get-ChildItem $d -Filter "*gpui_macros*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($pm) {
               "PROBE {0} sha={1} mtime={2} size={3}" -f $pm.Name, (Get-FileHash $pm.FullName -Algorithm SHA256).Hash, $pm.LastWriteTimeUtc.ToString("o"), $pm.Length
@@ -118,10 +121,10 @@ jobs:
           for ($i = 1; $i -le $passes; $i++) {
             if ($i -gt 1) {
               # same content, new mtime: forces cargo to re-invoke rustc
-              (Get-Content "crates/$crate/src/lib.rs" -Raw) |
-                Set-Content "crates/$crate/src/lib.rs" -NoNewline
-              (Get-Content "crates/gpui_macros/src/gpui_macros.rs" -Raw) |
-                Set-Content "crates/gpui_macros/src/gpui_macros.rs" -NoNewline
+              (Get-Content (Join-Path $ws "crates/$crate/src/lib.rs") -Raw) |
+                Set-Content (Join-Path $ws "crates/$crate/src/lib.rs") -NoNewline
+              (Get-Content (Join-Path $ws "crates/gpui_macros/src/gpui_macros.rs") -Raw) |
+                Set-Content (Join-Path $ws "crates/gpui_macros/src/gpui_macros.rs") -NoNewline
             }
             $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
             $h0 = 0; $r0 = 0
@@ -129,8 +132,8 @@ jobs:
             if ($stats -match "Compile requests\s+(\d+)") { $r0 = [int]$Matches[1] }
             Write-Host "===== PASS $i (before: requests=$r0 rustHits=$h0) ====="
             cargo --config .cargo/bundle-config.toml build -v --release --package $crate --target x86_64-pc-windows-msvc 2>&1 |
-              Tee-Object -FilePath "probe-pass$i.log" | Select-Object -Last 3
-            Get-DllFingerprint | Set-Content "dll-hash-pass$i.txt"
+              Tee-Object -FilePath (Join-Path $ws "probe-pass$i.log") | Select-Object -Last 3
+            Get-DllFingerprint | Set-Content (Join-Path $ws "dll-hash-pass$i.txt")
             $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
             $h1 = 0; $r1 = 0; $m1 = 0
             if ($stats -match "Cache hits \(Rust\)\s+(\d+)") { $h1 = [int]$Matches[1] }
@@ -139,9 +142,9 @@ jobs:
             $units = $r1 - $r0
             $hits = $h1 - $h0
             Write-Host "===== PASS $i result: units=$units hits=$hits misses=$($units-$hits) ====="
-            "pass${i}: units=$units hits=$hits" | Add-Content probe-summary.txt
+            "pass${i}: units=$units hits=$hits" | Add-Content (Join-Path $ws "probe-summary.txt")
           }
-          Copy-Item D:\a\_temp\sccache-server.log .\sccache-server.log -ErrorAction SilentlyContinue
+          Copy-Item D:\a\_temp\sccache-server.log (Join-Path $ws "sccache-server.log") -ErrorAction SilentlyContinue
 
       - name: Upload probe logs
         if: always()
