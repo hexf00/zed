@@ -108,6 +108,10 @@ jobs:
             $d = "target/x86_64-pc-windows-msvc/release/deps"
             Get-ChildItem $d -Filter *.dll -ErrorAction SilentlyContinue | Sort-Object Name |
               ForEach-Object { "{0}={1}" -f $_.Name, (Get-FileHash $_.Name -Algorithm SHA256).Hash }
+            $pm = Get-ChildItem $d -Filter "libgpui_macros*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($pm) {
+              "PROBE {0} sha={1} mtime={2} size={3}" -f $pm.Name, (Get-FileHash $pm.FullName -Algorithm SHA256).Hash, $pm.LastWriteTimeUtc.ToString("o"), $pm.Length
+            } else { "PROBE libgpui_macros*.dll NOT FOUND" }
           }
           for ($i = 1; $i -le $passes; $i++) {
             if ($i -gt 1) {
@@ -146,4 +150,5 @@ jobs:
             probe-pass*.log
             probe-summary.txt
             sccache-server.log
+            dll-hash-pass*.txt
           if-no-files-found: warn
