@@ -143,10 +143,18 @@ jobs:
           if (-not (Test-Path $bin)) {
             throw "fork sccache binary not in GHA cache - dispatch 'Fork sccache build' once, then rerun"
           }
-          Copy-Item $bin $env:SCCACHE_PATH -Force
-          # SCCACHE_PATH is extensionless ("...\x64/sccache"); invoke through
-          # cmd so Windows runs it as a PE instead of pwsh's path resolution.
-          $v = cmd /c "`"$env:SCCACHE_PATH`" --version" 2>&1
+          # SCCACHE_PATH itself is extensionless ("...\x64/sccache"), and
+          # Windows appends .exe when CreateProcess/cmd resolve it — so the
+          # binary that actually runs is "<SCCACHE_PATH>.exe". Overwrite THAT
+          # file, not the extensionless one.
+          $dst = ($env:SCCACHE_PATH -replace '/', '\') + '.exe'
+          if (-not (Test-Path $dst)) { throw "action sccache.exe not found at $dst" }
+          Copy-Item -LiteralPath $bin -Destination $dst -Force
+          $dstHash = (Get-FileHash $dst -Algorithm SHA256).Hash
+          Write-Host "destination hash: $dstHash"
+          $srcHash = (Get-FileHash $bin -Algorithm SHA256).Hash
+          if ($dstHash -ne $srcHash) { throw "fork sccache copy failed (hash mismatch)" }
+          $v = & $dst --version
           Write-Host "active sccache: $v"
           if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: '$v'" }
 
