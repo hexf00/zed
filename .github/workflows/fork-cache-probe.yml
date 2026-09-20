@@ -26,6 +26,10 @@ on:
         options:
           - "2"
           - "3"
+      link_args:
+        description: MSVC LINK env value for every link.exe
+        type: string
+        default: "/TIMESTAMP:0"
 
 permissions:
   contents: read
@@ -50,10 +54,12 @@ jobs:
       # link.exe reads the LINK env var and prepends it to its options for
       # EVERY invocation (host artifacts included). With --target, cargo on
       # stable gives host artifacts (proc-macros/build scripts) NO rustflags
-      # at all, so /Brepro cannot reach their links through rustflags — the
-      # env var is the only channel. This pins the COFF/debug-dir timestamps
-      # that otherwise change every relink and poison downstream sccache keys.
-      LINK: "/Brepro"
+      # at all, so linker options cannot reach their links through rustflags
+      # — the env var is the only channel. /Brepro is unusable here: its
+      # output hash covers rustc's per-invocation random temp paths, so the
+      # dll still varies. /TIMESTAMP:<fixed> pins the PE timestamp fields
+      # directly without input hashing.
+      LINK: ${{ inputs.link_args }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
