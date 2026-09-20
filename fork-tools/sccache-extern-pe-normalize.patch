@@ -45,7 +45,7 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
              "[{}]: hashing {} staticlibs",
 diff -ruN a/src/util.rs b/src/util.rs
 --- a/src/util.rs	2026-09-21 02:51:04.963377813 +0800
-+++ b/src/util.rs	2026-09-21 03:38:44.300084955 +0800
++++ b/src/util.rs	2026-09-21 03:48:32.716628003 +0800
 @@ -455,6 +455,205 @@
      Ok(())
  }
@@ -252,7 +252,7 @@ diff -ruN a/src/util.rs b/src/util.rs
  /// Format `duration` as seconds with a fractional component.
  pub fn fmt_duration_as_secs(duration: &Duration) -> String {
      format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
-@@ -1530,11 +1729,94 @@
+@@ -1530,11 +1729,96 @@
      executable.to_path_buf()
  }
  
@@ -312,11 +312,13 @@ diff -ruN a/src/util.rs b/src/util.rs
 +        for b in pe[rsds + 4..rsds + 24].iter_mut() {
 +            *b = 0xAA;
 +        }
-+        // Debug entry 1: REPRO input-hash payload.
++        // Debug entry 1: REPRO input-hash payload. Entry stride is 28:
++        // TimeDateStamp at +4, Type at +12, SizeOfData at +16,
++        // PointerToRawData at +24.
 +        pe[dbg + 32..dbg + 36].copy_from_slice(&0x6ab017f9u32.to_le_bytes());
-+        pe[dbg + 44..dbg + 48].copy_from_slice(&16u32.to_le_bytes());
-+        pe[dbg + 48..dbg + 52].copy_from_slice(&8u32.to_le_bytes());
-+        pe[dbg + 56..dbg + 60].copy_from_slice(&((rdata_off + 0xA0) as u32).to_le_bytes());
++        pe[dbg + 40..dbg + 44].copy_from_slice(&16u32.to_le_bytes());
++        pe[dbg + 44..dbg + 48].copy_from_slice(&8u32.to_le_bytes());
++        pe[dbg + 52..dbg + 56].copy_from_slice(&((rdata_off + 0xA0) as u32).to_le_bytes());
 +        let repro = rdata_off + 0xA0;
 +        for b in pe[repro..repro + 8].iter_mut() {
 +            *b = 0xBB;
