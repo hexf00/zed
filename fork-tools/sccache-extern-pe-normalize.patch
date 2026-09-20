@@ -12,8 +12,20 @@ diff -ruN a/Cargo.toml b/Cargo.toml
  description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible. Sccache has the capability to utilize caching in remote storage environments, including various cloud storage options, or alternatively, in local storage."
 diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
 --- a/src/compiler/rust.rs	2026-09-21 02:51:04.951377272 +0800
-+++ b/src/compiler/rust.rs	2026-09-21 02:51:25.752312300 +0800
-@@ -235,7 +235,7 @@
++++ b/src/compiler/rust.rs	2026-09-21 03:19:57.883949858 +0800
+@@ -26,7 +26,10 @@
+ #[cfg(feature = "dist-client")]
+ use crate::lru_disk_cache::{LruCache, Meter};
+ use crate::mock_command::{CommandCreatorSync, RunCommand};
+-use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
++use crate::util::{
++    Digest, fmt_duration_as_secs, hash_all, hash_all_archives, hash_all_externs,
++    run_input_output,
++};
+ use crate::util::{HashToDigest, OsStrExt};
+ use crate::{counted_array, dist};
+ use async_trait::async_trait;
+@@ -235,7 +238,7 @@
      LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
  
  /// Version number for cache key.
@@ -22,7 +34,7 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
  
  /// Get absolute paths for all source files and env-deps listed in rustc's dep-info output.
  async fn get_source_files_and_env_deps<T>(
-@@ -1448,7 +1448,7 @@
+@@ -1448,7 +1451,7 @@
              .iter()
              .map(|e| cwd.join(e))
              .collect::<Vec<_>>();
@@ -33,8 +45,8 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
              "[{}]: hashing {} staticlibs",
 diff -ruN a/src/util.rs b/src/util.rs
 --- a/src/util.rs	2026-09-21 02:51:04.963377813 +0800
-+++ b/src/util.rs	2026-09-21 03:07:07.889055530 +0800
-@@ -455,6 +455,195 @@
++++ b/src/util.rs	2026-09-21 03:19:47.943472722 +0800
+@@ -455,6 +455,204 @@
      Ok(())
  }
  
@@ -59,10 +71,10 @@ diff -ruN a/src/util.rs b/src/util.rs
 +        let f = f.clone();
 +        let pool = pool.clone();
 +        async move {
-+            match pool
++            let normalized = pool
 +                .spawn_blocking(move || normalized_extern_image_digest(&f))
-+                .await?
-+            {
++                .await??;
++            match normalized {
 +                Some(digest) => Ok(digest),
 +                None => Digest::file(&f, &pool).await,
 +            }
@@ -97,6 +109,60 @@ diff -ruN a/src/util.rs b/src/util.rs
 +    Ok(Some(digest.finish()))
 +}
 +
++fn pe_u16(data: &[u8], off: usize) -> Result<u16> {
++    Ok(u16::from_le_bytes(
++        data.get(off..off + 2)
++            .ok_or_else(|| anyhow!("PE header truncated"))?
++            .try_into()
++            .unwrap(),
++    ))
++}
++
++fn pe_u32(data: &[u8], off: usize) -> Result<u32> {
++    Ok(u32::from_le_bytes(
++        data.get(off..off + 4)
++            .ok_or_else(|| anyhow!("PE header truncated"))?
++            .try_into()
++            .unwrap(),
++    ))
++}
++
++fn pe_zero(data: &mut [u8], off: usize, len: usize) -> Result<()> {
++    data.get_mut(off..off + len)
++        .ok_or_else(|| anyhow!("PE range out of bounds"))
++        .map(|b| b.fill(0))
++}
++
++/// Map an RVA to a file offset via the section table
++/// `(vaddr, vsize, rawsize, rawaddr)` tuples.
++fn pe_rva_to_offset(sections: &[(u32, u32, u32, u32)], rva: u32) -> Option<usize> {
++    sections
++        .iter()
++        .find(|&&(vaddr, vsize, rsize, _)| {
++            rva >= vaddr && rva < vaddr.saturating_add(vsize.max(rsize))
++        })
++        .map(|&(vaddr, _, _, raddr)| raddr as usize + (rva - vaddr) as usize)
++}
++
++/// File offset and size of data directory `i`, or `None` when absent.
++fn pe_data_dir(
++    data: &[u8],
++    nrva: usize,
++    dd_off: usize,
++    sections: &[(u32, u32, u32, u32)],
++    i: usize,
++) -> Result<Option<(usize, usize)>> {
++    if i >= nrva {
++        return Ok(None);
++    }
++    let rva = pe_u32(data, dd_off + i * 8)?;
++    let size = pe_u32(data, dd_off + i * 8 + 4)? as usize;
++    if rva == 0 || size == 0 {
++        return Ok(None);
++    }
++    Ok(pe_rva_to_offset(sections, rva).map(|off| (off, size)))
++}
++
 +/// Zero the link-time-volatile bytes of a PE image in place.
 +///
 +/// Covers every field observed (or documented) to vary between links of
@@ -106,123 +172,78 @@ diff -ruN a/src/util.rs b/src/util.rs
 +/// the bound import directory. Returns `Err` when the buffer is not a PE
 +/// image with a layout this function understands.
 +fn normalize_pe_volatile_bytes(data: &mut [u8]) -> Result<()> {
-+    fn u16_at(data: &[u8], off: usize) -> Result<u16> {
-+        Ok(u16::from_le_bytes(
-+            data.get(off..off + 2)
-+                .ok_or_else(|| anyhow!("PE header truncated"))?
-+                .try_into()
-+                .unwrap(),
-+        ))
-+    }
-+    fn u32_at(data: &[u8], off: usize) -> Result<u32> {
-+        Ok(u32::from_le_bytes(
-+            data.get(off..off + 4)
-+                .ok_or_else(|| anyhow!("PE header truncated"))?
-+                .try_into()
-+                .unwrap(),
-+        ))
-+    }
-+    fn zero(data: &mut [u8], off: usize, len: usize) -> Result<()> {
-+        data.get_mut(off..off + len)
-+            .ok_or_else(|| anyhow!("PE range out of bounds"))
-+            .map(|b| b.fill(0))
-+    }
-+    /// Map an RVA to a file offset via the section table.
-+    fn rva_to_offset(sections: &[(u32, u32, u32, u32)], rva: u32) -> Option<usize> {
-+        for &(vaddr, vsize, rsize, raddr) in sections {
-+            if rva >= vaddr && rva < vaddr.saturating_add(vsize.max(rsize)) {
-+                return Some(raddr as usize + (rva - vaddr) as usize);
-+            }
-+        }
-+        None
-+    }
-+
-+    let e_lfanew = u32_at(data, 0x3c)? as usize;
++    let e_lfanew = pe_u32(data, 0x3c)? as usize;
 +    if data.get(e_lfanew..e_lfanew + 4) != Some(b"PE\0\0") {
 +        bail!("not a PE image");
 +    }
 +    let coff = e_lfanew + 4;
 +    // COFF header: Machine(2) NumberOfSections(2) TimeDateStamp(4) ...
-+    zero(data, coff + 4, 4)?;
-+    let nsections = u16_at(data, coff + 2)? as usize;
-+    let opt_size = u16_at(data, coff + 16)? as usize;
++    pe_zero(data, coff + 4, 4)?;
++    let nsections = pe_u16(data, coff + 2)? as usize;
++    let opt_size = pe_u16(data, coff + 16)? as usize;
 +    let opt = coff + 20;
-+    let magic = u16_at(data, opt)?;
++    let magic = pe_u16(data, opt)?;
 +    let (nrva_off, dd_off) = match magic {
 +        0x20b => (opt + 108, opt + 112), // PE32+
 +        0x10b => (opt + 92, opt + 96),   // PE32
 +        _ => bail!("unknown optional header magic"),
 +    };
-+    let nrva = u32_at(data, nrva_off)? as usize;
++    let nrva = pe_u32(data, nrva_off)? as usize;
 +    let sections_off = opt + opt_size;
 +    let mut sections = Vec::with_capacity(nsections);
-+    for i in 0..nsections {
-+        let s = sections_off + i * 40;
++    for s in 0..nsections {
++        let s = sections_off + s * 40;
 +        // Section header: Name(8) VirtualSize(4) VirtualAddress(4)
 +        // SizeOfRawData(4) PointerToRawData(4).
-+        let vsize = u32_at(data, s + 8)?;
-+        let vaddr = u32_at(data, s + 12)?;
-+        let rsize = u32_at(data, s + 16)?;
-+        let raddr = u32_at(data, s + 20)?;
++        let vsize = pe_u32(data, s + 8)?;
++        let vaddr = pe_u32(data, s + 12)?;
++        let rsize = pe_u32(data, s + 16)?;
++        let raddr = pe_u32(data, s + 20)?;
 +        sections.push((vaddr, vsize, rsize, raddr));
 +    }
-+    let dir = |i: usize| -> Result<Option<(usize, usize)>> {
-+        if i >= nrva {
-+            return Ok(None);
-+        }
-+        let rva = u32_at(data, dd_off + i * 8)?;
-+        let size = u32_at(data, dd_off + i * 8 + 4)? as usize;
-+        if rva == 0 || size == 0 {
-+            return Ok(None);
-+        }
-+        match rva_to_offset(&sections, rva) {
-+            Some(off) => Ok(Some((off, size))),
-+            None => Ok(None),
-+        }
-+    };
 +    // Export directory (index 0): TimeDateStamp at +4.
-+    if let Some((off, _)) = dir(0)? {
-+        zero(data, off + 4, 4)?;
++    if let Some((off, _)) = pe_data_dir(data, nrva, dd_off, &sections, 0)? {
++        pe_zero(data, off + 4, 4)?;
 +    }
 +    // Import directory (index 1): zero TimeDateStamp of each
 +    // IMAGE_IMPORT_DESCRIPTOR (20 bytes, ts at +4, until an all-zero entry).
-+    if let Some((off, size)) = dir(1)? {
++    if let Some((off, size)) = pe_data_dir(data, nrva, dd_off, &sections, 1)? {
 +        let mut i = 0;
 +        while i + 20 <= size {
 +            if data[off + i..off + i + 20].iter().all(|&b| b == 0) {
 +                break;
 +            }
-+            zero(data, off + i + 4, 4)?;
++            pe_zero(data, off + i + 4, 4)?;
 +            i += 20;
 +        }
 +    }
 +    // Debug directory (index 6): zero each entry's TimeDateStamp, plus the
 +    // CodeView RSDS GUID+PDB age and the whole REPRO payload.
-+    if let Some((off, size)) = dir(6)? {
++    if let Some((off, size)) = pe_data_dir(data, nrva, dd_off, &sections, 6)? {
 +        let mut i = 0;
 +        while i + 28 <= size {
-+            zero(data, off + i + 4, 4)?;
-+            let entry_type = u32_at(data, off + i + 12)?;
-+            let payload_size = u32_at(data, off + i + 16)? as usize;
-+            let payload_off = u32_at(data, off + i + 24)? as usize;
++            pe_zero(data, off + i + 4, 4)?;
++            let entry_type = pe_u32(data, off + i + 12)?;
++            let payload_size = pe_u32(data, off + i + 16)? as usize;
++            let payload_off = pe_u32(data, off + i + 24)? as usize;
 +            match entry_type {
 +                // IMAGE_DEBUG_TYPE_CODEVIEW
 +                2 if payload_size >= 24 => {
 +                    if data.get(payload_off..payload_off + 4) == Some(b"RSDS") {
 +                        // Zero GUID (4..20) and PDB age (20..24).
-+                        zero(data, payload_off + 4, 20)?;
++                        pe_zero(data, payload_off + 4, 20)?;
 +                    }
 +                }
 +                // IMAGE_DEBUG_TYPE_REPRO: whole payload is an input hash.
-+                16 => zero(data, payload_off, payload_size)?,
++                16 => pe_zero(data, payload_off, payload_size)?,
 +                _ => {}
 +            }
 +            i += 28;
 +        }
 +    }
 +    // Bound import directory (index 11): metadata-only optimization, zero it.
-+    if let Some((off, size)) = dir(11)? {
-+        zero(data, off, size)?;
++    if let Some((off, size)) = pe_data_dir(data, nrva, dd_off, &sections, 11)? {
++        pe_zero(data, off, size)?;
 +    }
 +    Ok(())
 +}
@@ -230,7 +251,7 @@ diff -ruN a/src/util.rs b/src/util.rs
  /// Format `duration` as seconds with a fractional component.
  pub fn fmt_duration_as_secs(duration: &Duration) -> String {
      format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
-@@ -1530,11 +1719,94 @@
+@@ -1530,11 +1728,94 @@
      executable.to_path_buf()
  }
  
@@ -265,7 +286,7 @@ diff -ruN a/src/util.rs b/src/util.rs
 +        let nrva_off = opt + 108;
 +        let dd_off = opt + 112;
 +        pe[nrva_off..nrva_off + 4].copy_from_slice(&16u32.to_le_bytes());
-+        let set_dir = |i: usize, rva: u32, size: u32| {
++        let mut set_dir = |i: usize, rva: u32, size: u32| {
 +            pe[dd_off + i * 8..dd_off + i * 8 + 4].copy_from_slice(&rva.to_le_bytes());
 +            pe[dd_off + i * 8 + 4..dd_off + i * 8 + 8].copy_from_slice(&size.to_le_bytes());
 +        };
