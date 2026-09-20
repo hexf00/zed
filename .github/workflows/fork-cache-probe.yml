@@ -44,6 +44,9 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "7200"
       CARGO_BUILD_JOBS: "16"
       SCCACHE_LOG: "debug"
+      # Match production: at debug=0 the PE has no debug directory/PDB GUID,
+      # isolating PE-timestamp variance from debug-info variance.
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
