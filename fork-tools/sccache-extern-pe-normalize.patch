@@ -100,7 +100,7 @@ diff -ruN a/src/cmdline.rs b/src/cmdline.rs
              } else if matches.get_flag("zero-stats") {
 diff -ruN a/src/commands.rs b/src/commands.rs
 --- a/src/commands.rs	2026-09-14 17:50:17.000000000 +0800
-+++ b/src/commands.rs	2026-09-21 23:12:46.457370691 +0800
++++ b/src/commands.rs	2026-09-21 23:56:23.362011304 +0800
 @@ -12,7 +12,9 @@
  // See the License for the specific language governing permissions and
  // limitations under the License.
@@ -203,7 +203,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
  /// Run `cmd` and return the process exit status.
  pub fn run_command(cmd: Command) -> Result<i32> {
      // Config isn't required for all commands, but if it's broken then we should flag
-@@ -740,6 +817,323 @@
+@@ -740,6 +817,325 @@
                  StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
              }
          }
@@ -262,10 +262,13 @@ diff -ruN a/src/commands.rs b/src/commands.rs
 +            let pushed = std::sync::Arc::new(AtomicUsize::new(0));
 +            let failed = std::sync::Arc::new(AtomicUsize::new(0));
 +            let start = std::time::Instant::now();
++            let index_json = serde_json::to_string_pretty(&ForkChunkIndex { chunks: chunks.clone() })?;
 +            runtime.block_on(async {
 +                futures::stream::iter(chunks)
 +                    .map(|chunk| {
 +                        let gha = gha.clone();
++                        let store = store.clone();
++                        let fetched = fetched.clone();
 +                        let pushed = pushed.clone();
 +                        let failed = failed.clone();
 +                        async move {
@@ -318,7 +321,6 @@ diff -ruN a/src/commands.rs b/src/commands.rs
 +                    .await;
 +            });
 +
-+            let index_json = serde_json::to_string_pretty(&ForkChunkIndex { chunks })?;
 +            fs::write(&index, index_json)?;
 +            println!(
 +                "fork-push-chunks: reused {} pushed {} failed {} in {}s",
