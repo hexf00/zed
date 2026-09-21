@@ -181,7 +181,7 @@ jobs:
         # entry. Deps install into fork-tools/node_modules (gitignored).
         shell: pwsh
         run: |
-          npm install --no-audit --no-fund --prefix fork-tools
+          npm install --no-audit --no-fund --prefix fork-tools "@actions/cache@6.2.0"
           if (-not (Test-Path "fork-tools\node_modules\@actions\cache")) {
             throw "@actions/cache install failed"
           }
