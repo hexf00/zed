@@ -1,5 +1,5 @@
 diff -ruN a/Cargo.toml b/Cargo.toml
---- a/Cargo.toml	2026-09-21 02:51:04.907375295 +0800
+--- a/Cargo.toml	2026-09-14 17:50:17.000000000 +0800
 +++ b/Cargo.toml	2026-09-21 02:51:25.752312300 +0800
 @@ -3,7 +3,7 @@
  edition = "2024"
@@ -11,19 +11,35 @@ diff -ruN a/Cargo.toml b/Cargo.toml
  categories = ["command-line-utilities", "development-tools::build-utils"]
  description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible. Sccache has the capability to utilize caching in remote storage environments, including various cloud storage options, or alternatively, in local storage."
 diff -ruN a/src/cmdline.rs b/src/cmdline.rs
---- a/src/cmdline.rs	2026-09-21 02:51:04.939376733 +0800
-+++ b/src/cmdline.rs	2026-09-21 17:53:36.975955744 +0800
-@@ -80,6 +80,9 @@
+--- a/src/cmdline.rs	2026-09-14 17:50:17.000000000 +0800
++++ b/src/cmdline.rs	2026-09-21 21:44:31.996612288 +0800
+@@ -80,6 +80,25 @@
          env_vars: Vec<(OsString, OsString)>,
      },
      DebugPreprocessorCacheEntries,
 +    /// Fork: fetch cache entries listed in the index file (one 64-hex key
 +    /// per line) into the local disk store (L0) concurrently.
 +    ForkFetchKeys(PathBuf),
++    /// Fork: pack the local disk store into content-addressed chunks and
++    /// push them to the GHA backend, writing the chunk index.
++    ForkPushChunks {
++        /// The local disk store directory (L0).
++        store: PathBuf,
++        /// Where to write the chunk index JSON.
++        index: PathBuf,
++    },
++    /// Fork: fetch the chunks listed in the chunk index and unpack their
++    /// entries into the local disk store (L0).
++    ForkFetchChunks {
++        /// The chunk index JSON.
++        index: PathBuf,
++        /// The local disk store directory (L0).
++        store: PathBuf,
++    },
  }
  
  fn flag_infer_long_and_short(name: &'static str) -> Arg {
-@@ -138,6 +141,11 @@
+@@ -138,6 +157,21 @@
              flag_infer_long("debug-preprocessor-cache")
                  .help("show all preprocessor cache entries")
                  .action(ArgAction::SetTrue),
@@ -32,30 +48,71 @@ diff -ruN a/src/cmdline.rs b/src/cmdline.rs
 +                .value_name("INDEX")
 +                .value_parser(clap::value_parser!(PathBuf))
 +                .num_args(1),
++            flag_infer_long("fork-push-chunks")
++                .help("pack STORE into chunks, push them, write chunk INDEX")
++                .value_names(["STORE", "INDEX"])
++                .value_parser(clap::value_parser!(PathBuf))
++                .num_args(2),
++            flag_infer_long("fork-fetch-chunks")
++                .help("fetch chunks listed in chunk INDEX and unpack into STORE")
++                .value_names(["INDEX", "STORE"])
++                .value_parser(clap::value_parser!(PathBuf))
++                .num_args(2),
              flag_infer_long("stop-server")
                  .help("stop background server")
                  .action(ArgAction::SetTrue),
-@@ -170,6 +178,7 @@
+@@ -170,6 +204,9 @@
                  .args([
                      "dist-auth",
                      "debug-preprocessor-cache",
 +                    "fork-fetch-keys",
++                    "fork-push-chunks",
++                    "fork-fetch-chunks",
                      "dist-status",
                      "show-stats",
                      "show-adv-stats",
-@@ -275,6 +284,8 @@
+@@ -275,6 +312,26 @@
                  Ok(Command::StartServer)
              } else if matches.get_flag("debug-preprocessor-cache") {
                  Ok(Command::DebugPreprocessorCacheEntries)
 +            } else if let Some(index) = matches.get_one::<PathBuf>("fork-fetch-keys") {
 +                Ok(Command::ForkFetchKeys(PathBuf::from(index)))
++            } else if matches.contains_id("fork-push-chunks") {
++                let mut v = matches
++                    .get_many::<PathBuf>("fork-push-chunks")
++                    .expect("`fork-push-chunks` requires two values")
++                    .cloned()
++                    .collect::<Vec<_>>();
++                let index = v.pop().expect("index");
++                let store = v.pop().expect("store");
++                Ok(Command::ForkPushChunks { store, index })
++            } else if matches.contains_id("fork-fetch-chunks") {
++                let mut v = matches
++                    .get_many::<PathBuf>("fork-fetch-chunks")
++                    .expect("`fork-fetch-chunks` requires two values")
++                    .cloned()
++                    .collect::<Vec<_>>();
++                let store = v.pop().expect("store");
++                let index = v.pop().expect("index");
++                Ok(Command::ForkFetchChunks { index, store })
              } else if matches.get_flag("stop-server") {
                  Ok(Command::StopServer)
              } else if matches.get_flag("zero-stats") {
 diff -ruN a/src/commands.rs b/src/commands.rs
---- a/src/commands.rs	2026-09-21 02:51:04.939376733 +0800
-+++ b/src/commands.rs	2026-09-21 21:03:02.223122506 +0800
-@@ -35,7 +35,7 @@
+--- a/src/commands.rs	2026-09-14 17:50:17.000000000 +0800
++++ b/src/commands.rs	2026-09-21 21:46:25.258154741 +0800
+@@ -12,7 +12,9 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-use crate::cache::{IpcStorage, storage_from_config};
++use crate::cache::{
++    build_single_cache, storage_from_config, IpcStorage, Storage,
++};
+ use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
+ use crate::cmdline::{Command, StatsFormat};
+ use crate::compiler::ColorMode;
+@@ -35,7 +37,7 @@
  use std::os::unix::process::ExitStatusExt;
  #[cfg(windows)]
  use std::os::windows::io::AsRawHandle;
@@ -64,10 +121,309 @@ diff -ruN a/src/commands.rs b/src/commands.rs
  use std::process;
  use std::sync::Arc;
  use std::time::Duration;
-@@ -740,6 +740,102 @@
+@@ -715,6 +717,80 @@
+     Ok(exit_code)
+ }
+ 
++/// A GHA-backend-only storage (no disk level) for the fork chunk
++/// transport, built from the same env config the server uses.
++fn fork_gha_storage(
++    config: &Config,
++    pool: &tokio::runtime::Handle,
++) -> Result<std::sync::Arc<dyn Storage>> {
++    let cache = config
++        .cache
++        .as_ref()
++        .ok_or_else(|| anyhow!("no cache backend configured"))?;
++    let gha = cache
++        .gha
++        .as_ref()
++        .ok_or_else(|| anyhow!("gha cache is not configured"))?;
++    let cache_type = crate::config::CacheType::GHA(gha.clone());
++    build_single_cache(&cache_type, &config.basedirs, pool, config.skip_cache_check)
++}
++
++#[derive(serde::Serialize, serde::Deserialize)]
++struct ForkChunkEntry {
++    k: String,
++    off: u64,
++    len: u64,
++}
++
++#[derive(serde::Serialize, serde::Deserialize)]
++struct ForkChunk {
++    key: String,
++    size: u64,
++    entries: Vec<ForkChunkEntry>,
++}
++
++#[derive(serde::Serialize, serde::Deserialize)]
++struct ForkChunkIndex {
++    chunks: Vec<ForkChunk>,
++}
++
++/// Build a chunk (manifest + key) from a group of store entries.
++fn fork_build_chunk(group: &[(String, std::path::PathBuf, u64)]) -> Result<ForkChunk> {
++    let mut hasher = crate::util::Digest::new();
++    let mut entries = Vec::with_capacity(group.len());
++    let mut off = 0u64;
++    for (key, _, len) in group {
++        hasher.update(key.as_bytes());
++        entries.push(ForkChunkEntry {
++            k: key.clone(),
++            off,
++            len: *len,
++        });
++        off += len;
++    }
++    Ok(ForkChunk {
++        key: hasher.finish(),
++        size: off,
++        entries,
++    })
++}
++
++/// Read and concatenate a chunk's entry bytes from the disk store.
++fn fork_read_chunk_bytes(
++    chunk: &ForkChunk,
++    store: &Path,
++) -> Result<bytes::Bytes> {
++    let mut out = Vec::with_capacity(chunk.size as usize);
++    for entry in &chunk.entries {
++        let path = Path::new(store)
++            .join(&entry.k[0..1])
++            .join(&entry.k[1..2])
++            .join(&entry.k);
++        out.extend_from_slice(&std::fs::read(path)?);
++    }
++    Ok(bytes::Bytes::from(out))
++}
++
+ /// Run `cmd` and return the process exit status.
+ pub fn run_command(cmd: Command) -> Result<i32> {
+     // Config isn't required for all commands, but if it's broken then we should flag
+@@ -740,6 +816,320 @@
                  StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
              }
          }
++        Command::ForkPushChunks { store, index } => {
++            // FORK: pack the disk store (L0) entries into content-addressed
++            // chunks (<=64 entries and <=96 MiB each), skip chunks already
++            // present in the GHA backend, push the rest, and write the
++            // chunk index JSON. The GHA cache metadata endpoint throttles
++            // per-repo (uploads: 200/min, downloads: ~1500/min), which is
++            // exactly why entries travel in chunks.
++            use std::collections::BTreeMap;
++
++            let runtime = new_client_runtime()?;
++            let gha = fork_gha_storage(config, runtime.handle())?;
++            let mut entries: BTreeMap<String, PathBuf> = BTreeMap::new();
++            for shard in fs::read_dir(&store).with_context(|| {
++                format!("Failed to read disk store dir {}", store.display())
++            })? {
++                let shard = shard?;
++                if shard.file_type()?.is_dir() {
++                    for e in fs::read_dir(shard.path())? {
++                        let e = e?;
++                        let name = e.file_name().to_string_lossy().to_string();
++                        if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
++                            entries.insert(name, e.path());
++                        }
++                    }
++                }
++            }
++            if entries.is_empty() {
++                bail!("disk store {} is empty", store.display());
++            }
++
++            const MAX_ENTRIES: usize = 64;
++            const MAX_BYTES: u64 = 96 * 1024 * 1024;
++            let mut chunks: Vec<Chunk> = Vec::new();
++            let mut group: Vec<(String, PathBuf, u64)> = Vec::new();
++            let mut group_bytes = 0u64;
++            for (key, path) in &entries {
++                let len = fs::metadata(path)?.len();
++                group.push((key.clone(), path.clone(), len));
++                group_bytes += len;
++                if group.len() >= MAX_ENTRIES || group_bytes >= MAX_BYTES {
++                    chunks.push(fork_build_chunk(&group)?);
++                    group.clear();
++                    group_bytes = 0;
++                }
++            }
++            if !group.is_empty() {
++                chunks.push(fork_build_chunk(&group)?);
++            }
++
++            let fetched = std::sync::Arc::new(AtomicUsize::new(0));
++            let pushed = std::sync::Arc::new(AtomicUsize::new(0));
++            let failed = std::sync::Arc::new(AtomicUsize::new(0));
++            let start = std::time::Instant::now();
++            runtime.block_on(async {
++                futures::stream::iter(chunks)
++                    .map(|chunk| {
++                        let gha = gha.clone();
++                        let pushed = pushed.clone();
++                        let failed = failed.clone();
++                        async move {
++                            // Chunks are content-addressed by their member
++                            // keys: an unchanged chunk has the same key and
++                            // is already in the backend, so push only what
++                            // is new or changed.
++                            match gha.get_raw(&chunk.key).await {
++                                Ok(Some(_)) => {
++                                    fetched.fetch_add(1, Ordering::Relaxed);
++                                }
++                                _ => {
++                                    let data = match fork_read_chunk_bytes(&chunk, &store) {
++                                        Ok(d) => d,
++                                        Err(_) => {
++                                            failed.fetch_add(1, Ordering::Relaxed);
++                                            return;
++                                        }
++                                    };
++                                    let mut attempts = 0u32;
++                                    loop {
++                                        attempts += 1;
++                                        match gha.put_raw(&chunk.key, data.clone()).await {
++                                            Ok(_) => {
++                                                pushed.fetch_add(1, Ordering::Relaxed);
++                                                break;
++                                            }
++                                            Err(_) if attempts < 4 => {
++                                                tokio::time::timeout(
++                                                    std::time::Duration::from_millis(
++                                                        500 * u64::from(attempts),
++                                                    ),
++                                                    futures::future::ready(()),
++                                                )
++                                                .await
++                                                .ok();
++                                            }
++                                            Err(_) => {
++                                                failed.fetch_add(1, Ordering::Relaxed);
++                                                break;
++                                            }
++                                        }
++                                    }
++                                }
++                            }
++                        }
++                    })
++                    .buffer_unordered(8)
++                    .collect::<Vec<_>>()
++                    .await;
++            });
++
++            let index_json = serde_json::to_string_pretty(&ForkChunkIndex { chunks })?;
++            fs::write(&index, index_json)?;
++            println!(
++                "fork-push-chunks: reused {} pushed {} failed {} in {}s",
++                fetched.load(Ordering::Relaxed),
++                pushed.load(Ordering::Relaxed),
++                failed.load(Ordering::Relaxed),
++                start.elapsed().as_secs()
++            );
++            return Ok(0);
++        }
++        Command::ForkFetchChunks { index, store } => {
++            // FORK: fetch every chunk of the index with bounded concurrency
++            // (a handful of requests vs thousands for per-entry lookups) and
++            // unpack the entries into the disk store (L0). Entries already
++            // present are skipped.
++            use std::sync::atomic::{AtomicUsize, Ordering};
++
++            let runtime = new_client_runtime()?;
++            let gha = fork_gha_storage(config, runtime.handle())?;
++            let index_json = fs::read_to_string(&index)?;
++            let chunk_index: ForkChunkIndex = serde_json::from_str(&index_json)?;
++            let fetched = std::sync::Arc::new(AtomicUsize::new(0));
++            let missing = std::sync::Arc::new(AtomicUsize::new(0));
++            let entries_written = std::sync::Arc::new(AtomicUsize::new(0));
++            let failed = std::sync::Arc::new(AtomicUsize::new(0));
++            let start = std::time::Instant::now();
++            runtime.block_on(async {
++                futures::stream::iter(chunk_index.chunks)
++                    .map(|chunk| {
++                        let gha = gha.clone();
++                        let store = store.clone();
++                        let fetched = fetched.clone();
++                        let missing = missing.clone();
++                        let entries_written = entries_written.clone();
++                        let failed = failed.clone();
++                        async move {
++                            let mut attempts = 0u32;
++                            loop {
++                                attempts += 1;
++                                match gha.get_raw(&chunk.key).await {
++                                    Ok(Some(data)) => {
++                                        fetched.fetch_add(1, Ordering::Relaxed);
++                                        for entry in &chunk.entries {
++                                            let end = entry.off + entry.len;
++                                            if end > data.len() as u64 {
++                                                failed.fetch_add(1, Ordering::Relaxed);
++                                                continue;
++                                            }
++                                            let slice =
++                                                &data[entry.off as usize..end as usize];
++                                            let path = Path::new(&store)
++                                                .join(&entry.k[0..1])
++                                                .join(&entry.k[1..2])
++                                                .join(&entry.k);
++                                            if path.exists() {
++                                                continue;
++                                            }
++                                            if let Some(parent) = path.parent() {
++                                                let _ = std::fs::create_dir_all(parent);
++                                            }
++                                            match std::fs::write(path, slice) {
++                                                Ok(()) => {
++                                                    entries_written
++                                                        .fetch_add(1, Ordering::Relaxed);
++                                                }
++                                                Err(_) => {
++                                                    failed.fetch_add(1, Ordering::Relaxed);
++                                                }
++                                            }
++                                        }
++                                        break;
++                                    }
++                                    Ok(None) => {
++                                        missing.fetch_add(1, Ordering::Relaxed);
++                                        break;
++                                    }
++                                    Err(_) if attempts < 4 => {
++                                        tokio::time::timeout(
++                                            std::time::Duration::from_millis(
++                                                500 * u64::from(attempts),
++                                            ),
++                                            futures::future::ready(()),
++                                        )
++                                        .await
++                                        .ok();
++                                    }
++                                    Err(_) => {
++                                        failed.fetch_add(1, Ordering::Relaxed);
++                                        break;
++                                    }
++                                }
++                            }
++                        }
++                    })
++                    .buffer_unordered(8)
++                    .collect::<Vec<_>>()
++                    .await;
++            });
++            println!(
++                "fork-fetch-chunks: chunks fetched {} missing {} entries written {} failed {} in {}s",
++                fetched.load(Ordering::Relaxed),
++                missing.load(Ordering::Relaxed),
++                entries_written.load(Ordering::Relaxed),
++                failed.load(Ordering::Relaxed),
++                start.elapsed().as_secs()
++            );
++            return Ok(0);
++        }
 +        Command::ForkFetchKeys(index) => {
 +            // FORK: batch-fetch cache entries listed in `index` (one 64-hex
 +            // key per line) into the local disk store (L0) through the
@@ -168,7 +524,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
              trace!("Command::DebugPreprocessorCacheEntries");
              let entries_dir = default_disk_cache_dir().join("preprocessor");
 diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
---- a/src/compiler/rust.rs	2026-09-21 02:51:04.951377272 +0800
+--- a/src/compiler/rust.rs	2026-09-14 17:50:17.000000000 +0800
 +++ b/src/compiler/rust.rs	2026-09-21 05:52:04.765224855 +0800
 @@ -26,7 +26,10 @@
  #[cfg(feature = "dist-client")]
@@ -284,7 +640,7 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
                  executable: self.executable.clone(),
                  host: self.host.clone(),
 diff -ruN a/src/util.rs b/src/util.rs
---- a/src/util.rs	2026-09-21 02:51:04.963377813 +0800
+--- a/src/util.rs	2026-09-14 17:50:17.000000000 +0800
 +++ b/src/util.rs	2026-09-21 06:27:51.156377901 +0800
 @@ -455,6 +455,213 @@
      Ok(())
