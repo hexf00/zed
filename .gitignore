@@ -61,3 +61,6 @@ crates/docs_preprocessor/actions.json
 
 .local*
 .cache
+
+# chunk transport deps (npm install --prefix fork-tools)
+/fork-tools/node_modules/

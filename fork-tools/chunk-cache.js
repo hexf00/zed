@@ -18,12 +18,22 @@
 //   push:  pack .sccache-disk into chunks, upload the ones the index does
 //          not list yet, write the merged index back to chunks.json.
 //
-// Needs @actions/cache resolved via NODE_PATH (installed by the workflow
-// step: npm install --prefix "$RUNNER_TEMP/ccdeps" @actions/cache).
+// Needs the @actions/cache package (see fork-tools/package.json), resolved
+// from fork-tools/node_modules. The modern major is ESM-only and its
+// restore uses the V2 cache service (ACTIONS_RESULTS_URL); the old v3
+// restore needed the retired V1 ACTIONS_CACHE_URL and silently missed
+// every entry ("Cache Service Url not found"), which is why this file
+// uses dynamic import instead of require.
 
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+
+// ESM-only package: load lazily via dynamic import so the module also
+// works for the dry-run path and local tests that never touch the API.
+async function loadCache() {
+  return import("@actions/cache");
+}
 
 const MAX_ENTRIES = 16;
 const MAX_BYTES = 32 * 1024 * 1024;
@@ -115,36 +125,46 @@ async function fetch() {
     console.log(`dryrun: would fetch ${index.chunks.length} chunks`);
     return;
   }
-  const cache = require("@actions/cache");
+  const cache = await loadCache();
   const missing = [];
   let chunksOk = 0;
   let entriesWritten = 0;
   const start = Date.now();
-  for (const chunk of index.chunks) {
-    const staging = stagingDir(chunk.key);
-    rmrf(staging);
-    fs.mkdirSync(staging, { recursive: true });
-    let hit = null;
-    try {
-      hit = await cache.restoreCache([staging], chunk.key);
-    } catch (err) {
-      console.log(`restore ${chunk.key} failed: ${err.message}`);
-    }
-    if (!hit) {
-      missing.push(chunk.key);
+
+  // Independent staging dirs per chunk: safe to restore in parallel; the
+  // wall time of ~145 chunk downloads drops roughly by the pool size.
+  const CONCURRENCY = 8;
+  let cursor = 0;
+  async function worker() {
+    while (cursor < index.chunks.length) {
+      const chunk = index.chunks[cursor++];
+      const staging = stagingDir(chunk.key);
       rmrf(staging);
-      continue;
-    }
-    for (const f of fs.readdirSync(staging)) {
-      if (/^[0-9a-f]{64}$/.test(f) && moveIntoStore(path.join(staging, f), f)) {
-        entriesWritten += 1;
+      fs.mkdirSync(staging, { recursive: true });
+      let hit = null;
+      try {
+        hit = await cache.restoreCache([staging], chunk.key);
+      } catch (err) {
+        console.log(`restore ${chunk.key} failed: ${err.message}`);
       }
+      if (!hit) {
+        missing.push(chunk.key);
+        rmrf(staging);
+        continue;
+      }
+      for (const f of fs.readdirSync(staging)) {
+        if (/^[0-9a-f]{64}$/.test(f) && moveIntoStore(path.join(staging, f), f)) {
+          entriesWritten += 1;
+        }
+      }
+      rmrf(staging);
+      chunksOk += 1;
     }
-    rmrf(staging);
-    chunksOk += 1;
   }
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
   fs.mkdirSync(INDEX_DIR, { recursive: true });
-  fs.writeFileSync(MISSING, missing.join("\n"));
+  fs.writeFileSync(MISSING, missing.sort().join("\n"));
   console.log(
     `chunk-fetch: chunks ${index.chunks.length} ok ${chunksOk} missing ${missing.length} ` +
       `entries written ${entriesWritten} in ${Math.round((Date.now() - start) / 1000)}s`,
@@ -156,7 +176,7 @@ async function push() {
   if (entries.size === 0) {
     throw new Error(`disk store ${STORE} is empty`);
   }
-  const cache = process.env.CHUNK_CACHE_DRYRUN ? null : require("@actions/cache");
+  const cache = process.env.CHUNK_CACHE_DRYRUN ? null : await loadCache();
   const chunks = groupChunks(entries);
   const missing = fs.existsSync(MISSING)
     ? new Set(fs.readFileSync(MISSING, "utf8").split("\n").filter(Boolean))

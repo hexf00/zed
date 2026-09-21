@@ -175,14 +175,14 @@ jobs:
       - name: Install chunk transport deps
         # fork-tools/chunk-cache.js moves sccache store entries through the
         # GHA cache in content-addressed chunks via @actions/cache (the
-        # library behind actions/cache@v4). Zero checked-in node_modules:
-        # install once per job, reuse in the fetch and push steps.
+        # library behind actions/cache@v4). The modern major is ESM-only
+        # and restores over the V2 cache service; the old v3 library
+        # restored over the retired V1 service and silently missed every
+        # entry. Deps install into fork-tools/node_modules (gitignored).
         shell: pwsh
         run: |
-          # Pin major 3: newer @actions/cache is ESM-only and breaks the
-          # CommonJS require in chunk-cache.js (ERR_PACKAGE_PATH_NOT_EXPORTED).
-          npm install --no-audit --no-fund --prefix "$env:RUNNER_TEMP\ccdeps" "@actions/cache@3" 2>&1 | Select-Object -Last 1
-          if (-not (Test-Path "$env:RUNNER_TEMP\ccdeps\node_modules\@actions\cache")) {
+          npm install --no-audit --no-fund --prefix fork-tools
+          if (-not (Test-Path "fork-tools\node_modules\@actions\cache")) {
             throw "@actions/cache install failed"
           }
 
@@ -196,7 +196,6 @@ jobs:
         # build.
         shell: pwsh
         run: |
-          $env:NODE_PATH = "$env:RUNNER_TEMP\ccdeps\node_modules"
           node fork-tools/chunk-cache.js fetch
           if ($LASTEXITCODE -ne 0) { throw "chunk-cache fetch failed" }
 
@@ -427,7 +426,6 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path "$env:GITHUB_WORKSPACE\.sccache-disk")) { Write-Host "no disk store - skip"; exit 0 }
-          $env:NODE_PATH = "$env:RUNNER_TEMP\ccdeps\node_modules"
           node fork-tools/chunk-cache.js push
           if ($LASTEXITCODE -ne 0) { throw "chunk-cache push failed" }
 
