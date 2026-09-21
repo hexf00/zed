@@ -10,6 +10,139 @@ diff -ruN a/Cargo.toml b/Cargo.toml
  
  categories = ["command-line-utilities", "development-tools::build-utils"]
  description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible. Sccache has the capability to utilize caching in remote storage environments, including various cloud storage options, or alternatively, in local storage."
+diff -ruN a/src/cmdline.rs b/src/cmdline.rs
+--- a/src/cmdline.rs	2026-09-21 02:51:04.939376733 +0800
++++ b/src/cmdline.rs	2026-09-21 17:53:36.975955744 +0800
+@@ -80,6 +80,9 @@
+         env_vars: Vec<(OsString, OsString)>,
+     },
+     DebugPreprocessorCacheEntries,
++    /// Fork: fetch cache entries listed in the index file (one 64-hex key
++    /// per line) into the local disk store (L0) concurrently.
++    ForkFetchKeys(PathBuf),
+ }
+ 
+ fn flag_infer_long_and_short(name: &'static str) -> Arg {
+@@ -138,6 +141,11 @@
+             flag_infer_long("debug-preprocessor-cache")
+                 .help("show all preprocessor cache entries")
+                 .action(ArgAction::SetTrue),
++            flag_infer_long("fork-fetch-keys")
++                .help("fetch cache entries listed in INDEX (one key per line) into the disk store")
++                .value_name("INDEX")
++                .value_parser(clap::value_parser!(PathBuf))
++                .num_args(1),
+             flag_infer_long("stop-server")
+                 .help("stop background server")
+                 .action(ArgAction::SetTrue),
+@@ -170,6 +178,7 @@
+                 .args([
+                     "dist-auth",
+                     "debug-preprocessor-cache",
++                    "fork-fetch-keys",
+                     "dist-status",
+                     "show-stats",
+                     "show-adv-stats",
+@@ -275,6 +284,8 @@
+                 Ok(Command::StartServer)
+             } else if matches.get_flag("debug-preprocessor-cache") {
+                 Ok(Command::DebugPreprocessorCacheEntries)
++            } else if let Some(index) = matches.get_one::<PathBuf>("fork-fetch-keys") {
++                Ok(Command::ForkFetchKeys(PathBuf::from(index)))
+             } else if matches.get_flag("stop-server") {
+                 Ok(Command::StopServer)
+             } else if matches.get_flag("zero-stats") {
+diff -ruN a/src/commands.rs b/src/commands.rs
+--- a/src/commands.rs	2026-09-21 02:51:04.939376733 +0800
++++ b/src/commands.rs	2026-09-21 17:54:54.873732311 +0800
+@@ -35,7 +35,7 @@
+ use std::os::unix::process::ExitStatusExt;
+ #[cfg(windows)]
+ use std::os::windows::io::AsRawHandle;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::process;
+ use std::sync::Arc;
+ use std::time::Duration;
+@@ -740,6 +740,78 @@
+                 StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
+             }
+         }
++        Command::ForkFetchKeys { index } => {
++            // FORK: batch-fetch cache entries listed in `index` (one 64-hex
++            // key per line) into the local disk store (L0) through the
++            // configured storage backend, concurrently and independently of
++            // any build. Intended to run BEFORE the server starts so its
++            // DiskCache picks the prefetched files up at init.
++            use futures::StreamExt;
++            use std::sync::atomic::{AtomicUsize, Ordering};
++
++            let keys: Vec<String> = fs::read_to_string(&index)?
++                .lines()
++                .map(str::trim)
++                .filter(|l| l.len() == 64 && l.chars().all(|c| c.is_ascii_hexdigit()))
++                .map(str::to_owned)
++                .collect();
++            if keys.is_empty() {
++                bail!("no keys found in {}", index.display());
++            }
++            let dir = env::var_os("SCCACHE_DIR")
++                .map(PathBuf::from)
++                .ok_or_else(|| anyhow!("SCCACHE_DIR is not set"))?;
++            let runtime = new_client_runtime()?;
++            let storage = storage_from_config(config, runtime.handle())?;
++            let fetched = AtomicUsize::new(0);
++            let missing = AtomicUsize::new(0);
++            let failed = AtomicUsize::new(0);
++            let start = std::time::Instant::now();
++            runtime.block_on(async {
++                futures::stream::iter(keys)
++                    .map(|key| {
++                        let storage = storage.clone();
++                        async move {
++                            match storage.get_raw(&key).await {
++                                Ok(Some(data)) => {
++                                    let path = Path::new(&dir)
++                                        .join(&key[0..1])
++                                        .join(&key[1..2])
++                                        .join(&key);
++                                    if let Some(parent) = path.parent() {
++                                        let _ = std::fs::create_dir_all(parent);
++                                    }
++                                    match std::fs::write(&path, &data[..]) {
++                                        Ok(()) => {
++                                            fetched.fetch_add(1, Ordering::Relaxed);
++                                        }
++                                        Err(_) => {
++                                            failed.fetch_add(1, Ordering::Relaxed);
++                                        }
++                                    }
++                                }
++                                Ok(None) => {
++                                    missing.fetch_add(1, Ordering::Relaxed);
++                                }
++                                Err(_) => {
++                                    failed.fetch_add(1, Ordering::Relaxed);
++                                }
++                            }
++                        }
++                    })
++                    .buffer_unordered(32)
++                    .collect::<Vec<_>>()
++                    .await;
++            });
++            println!(
++                "fork-fetch-keys: fetched {} missing {} failed {} in {}s",
++                fetched.load(Ordering::Relaxed),
++                missing.load(Ordering::Relaxed),
++                failed.load(Ordering::Relaxed),
++                start.elapsed().as_secs()
++            );
++            Ok(0)
++        }
+         Command::DebugPreprocessorCacheEntries => {
+             trace!("Command::DebugPreprocessorCacheEntries");
+             let entries_dir = default_disk_cache_dir().join("preprocessor");
 diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
 --- a/src/compiler/rust.rs	2026-09-21 02:51:04.951377272 +0800
 +++ b/src/compiler/rust.rs	2026-09-21 05:52:04.765224855 +0800

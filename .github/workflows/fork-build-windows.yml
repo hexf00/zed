@@ -89,19 +89,17 @@ jobs:
           key: cargo-registry-windows-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-registry-windows-
 
-      - name: Restore sccache disk store (L0)
-        # Multilevel cache (SCCACHE_MULTILEVEL_CHAIN=disk,gha, upstream
-        # v0.18 feature): the local disk store is L0, GHA stays L2, and GHA
-        # hits are backfilled into L0 automatically. Restoring this rolling
-        # single-entry snapshot makes every sccache lookup a local-disk hit,
-        # removing the per-entry GHA round trips and the dependency-DAG
-        # download serialization that dominated the 28min prewarm.
+      - name: Restore sccache key index
+        # The index is tiny (one 64-hex key per line): it lists every cache
+        # entry known to exist in the GHA namespace. The build's prefetch
+        # step pulls exactly those entries into the local disk store (L0)
+        # at full network width, without cargo's DAG or job cap.
         uses: actions/cache@v4
         with:
-          path: .sccache-disk
-          key: sccache-disk-x86_64-${{ github.run_id }}
+          path: .sccache-keyindex
+          key: sccache-key-index-x86_64-${{ github.run_id }}
           restore-keys: |
-            sccache-disk-x86_64-
+            sccache-key-index-x86_64-
 
       - name: Restore uncacheable compiler layer
         # sccache hard-refuses build-script bins (CannotCache bin) and
@@ -171,6 +169,25 @@ jobs:
           $v = & $dst --version
           Write-Host "active sccache: $v"
           if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: '$v'" }
+
+      - name: Prefetch sccache entries via key index
+        # Batch-pull every indexed entry straight into the disk store (L0)
+        # with 32-way concurrency. MUST run before the server starts: the
+        # DiskCache only scans its directory at init, so files written
+        # after startup would be invisible to it.
+        shell: pwsh
+        run: |
+          $idx = ".sccache-keyindex\keys.txt"
+          if (-not (Test-Path $idx)) {
+            Write-Host "no key index yet - skipping prefetch (first run backfills via GHA)"
+            exit 0
+          }
+          $sccacheExe = ($env:SCCACHE_PATH -replace '/', '\') + '.exe'
+          $env:SCCACHE_MULTILEVEL_CHAIN = "disk,gha"
+          $env:SCCACHE_DIR = "$env:GITHUB_WORKSPACE\.sccache-disk"
+          $env:SCCACHE_CACHE_SIZE = "10G"
+          & $sccacheExe --fork-fetch-keys $idx
+          if ($LASTEXITCODE -ne 0) { throw "fork-fetch-keys failed" }
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
@@ -377,15 +394,29 @@ jobs:
           path: target/**/cargo-timings/*.html
           if-no-files-found: ignore
 
-      - name: Save sccache disk store (L0)
-        # Rolling single-entry snapshot of the disk store for the next run.
-        # always(): a cancelled run still banked everything backfilled
-        # before cancellation.
+      - name: Build sccache key index
+        # Union the restored index with every key currently in the disk
+        # store (backfilled or written this run). The store's filenames ARE
+        # the keys. always(): a cancelled run still indexed what it got.
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .sccache-keyindex | Out-Null
+          $keys = @()
+          if (Test-Path .sccache-keyindex\keys.txt) { $keys += Get-Content .sccache-keyindex\keys.txt }
+          if (Test-Path .sccache-disk) {
+            $keys += Get-ChildItem .sccache-disk -Recurse -File | ForEach-Object { $_.Name }
+          }
+          $keys = $keys | Where-Object { $_ -match '^[0-9a-f]{64}$' } | Sort-Object -Unique
+          $keys | Set-Content .sccache-keyindex\keys.txt
+          Write-Host "index keys: $($keys.Count)"
+
+      - name: Save sccache key index
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .sccache-disk
-          key: sccache-disk-x86_64-${{ github.run_id }}
+          path: .sccache-keyindex
+          key: sccache-key-index-x86_64-${{ github.run_id }}
 
       - name: Save uncacheable compiler layer
         # Persist this run's layer as the newest entry for the next run's
