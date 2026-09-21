@@ -54,7 +54,7 @@ diff -ruN a/src/cmdline.rs b/src/cmdline.rs
              } else if matches.get_flag("zero-stats") {
 diff -ruN a/src/commands.rs b/src/commands.rs
 --- a/src/commands.rs	2026-09-21 02:51:04.939376733 +0800
-+++ b/src/commands.rs	2026-09-21 18:06:42.201569243 +0800
++++ b/src/commands.rs	2026-09-21 18:16:56.111881418 +0800
 @@ -35,7 +35,7 @@
  use std::os::unix::process::ExitStatusExt;
  #[cfg(windows)]
@@ -64,7 +64,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
  use std::process;
  use std::sync::Arc;
  use std::time::Duration;
-@@ -740,6 +740,78 @@
+@@ -740,6 +740,82 @@
                  StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
              }
          }
@@ -91,14 +91,18 @@ diff -ruN a/src/commands.rs b/src/commands.rs
 +                .ok_or_else(|| anyhow!("SCCACHE_DIR is not set"))?;
 +            let runtime = new_client_runtime()?;
 +            let storage = storage_from_config(config, runtime.handle())?;
-+            let fetched = AtomicUsize::new(0);
-+            let missing = AtomicUsize::new(0);
-+            let failed = AtomicUsize::new(0);
++            let fetched = std::sync::Arc::new(AtomicUsize::new(0));
++            let missing = std::sync::Arc::new(AtomicUsize::new(0));
++            let failed = std::sync::Arc::new(AtomicUsize::new(0));
 +            let start = std::time::Instant::now();
 +            runtime.block_on(async {
 +                futures::stream::iter(keys)
 +                    .map(|key| {
 +                        let storage = storage.clone();
++                        let dir = dir.clone();
++                        let fetched = fetched.clone();
++                        let missing = missing.clone();
++                        let failed = failed.clone();
 +                        async move {
 +                            match storage.get_raw(&key).await {
 +                                Ok(Some(data)) => {
