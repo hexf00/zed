@@ -1,0 +1,194 @@
+# Fork-only A/B: whole-store caching vs the sccache granular flow.
+#
+# seed:    run the current prod pipeline (warm sccache) to produce a complete
+#          target/ dir fast, then save the WHOLE target/ as ONE pinned-key
+#          GHA cache entry (key never changes — stale artifacts are cargo's
+#          problem, per the pin-the-key decision).
+# measure: checkout -> normalize source mtimes -> restore the pinned entry
+#          -> Bundle directly (NO sccache). Cargo fingerprinting decides
+#          what is Fresh; on the same commit that should be everything.
+#
+# The mtime normalization is the load-bearing trick: fresh checkout stamps
+# every source with "now", and cargo fingerprints compare mtimes, so ~250
+# first-party crates would be judged dirty and rebuilt locally no matter
+# what was restored. Both modes stamp sources to the same fixed epoch so
+# recorded fingerprints match exactly.
+#
+# WARNING: saving a multi-GB entry evicts the sccache entries (shared 10GB
+# repo quota). If the A/B crowns the granular flow, a re-bank run is needed.
+name: Fork Wholestore Experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: seed = build+save target; measure = restore+time bundle
+        type: choice
+        default: measure
+        options:
+          - seed
+          - measure
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-wholestore-experiment
+  cancel-in-progress: true
+
+env:
+  WHOLESTORE_KEY: fork-wholestore-x86_64-v1
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "16"
+  GITHUB_RUN_NUMBER: "fork-stable"
+
+jobs:
+  experiment:
+    runs-on: windows-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Normalize source mtimes
+        # Both modes stamp the repo tree to one fixed epoch so cargo
+        # fingerprints recorded by seed match measure exactly.
+        shell: pwsh
+        run: |
+          $epoch = [datetime]'2020-01-01T00:00:00Z'
+          $files = Get-ChildItem -Recurse -File -Force |
+            Where-Object { $_.FullName -notmatch '\\\.git\\' }
+          Write-Host "normalizing $($files.Count) files"
+          foreach ($f in $files) { $f.LastWriteTimeUtc = $epoch }
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-windows-
+
+      - name: Alias VS Community to Enterprise
+        shell: pwsh
+        run: |
+          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+          $launch = "$vsRoot\Community\Common7\Tools\Launch-VsDevShell.ps1"
+          if (-not (Test-Path $launch)) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $installPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath | Select-Object -First 1
+            New-Item -ItemType Directory -Force -Path $vsRoot | Out-Null
+            if (Test-Path "$vsRoot\Community") {
+              Rename-Item "$vsRoot\Community" "Community.incomplete" -Force
+            }
+            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $installPath | Out-Null
+          }
+          Write-Host "VS junction ready"
+
+      - name: Ensure Inno Setup 6
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      # ---------- seed-only: warm-sccache fast path to a complete target ----------
+      - name: Setup sccache (seed)
+        if: inputs.mode == 'seed'
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      - name: Restore fork sccache (seed)
+        if: inputs.mode == 'seed'
+        uses: actions/cache@v4
+        id: fork-sccache
+        with:
+          path: ${{ runner.temp }}/sccache-fork
+          key: sccache-fork-0.18.0-fork.1-${{ hashFiles('fork-tools/*.patch') }}
+
+      - name: Install fork sccache (seed)
+        if: inputs.mode == 'seed'
+        shell: pwsh
+        run: |
+          $bin = Join-Path $env:RUNNER_TEMP "sccache-fork\sccache.exe"
+          if (-not (Test-Path $bin)) {
+            throw "fork sccache binary not in GHA cache - dispatch 'Fork sccache build' once, then rerun"
+          }
+          $dst = ($env:SCCACHE_PATH -replace '/', '\') + '.exe'
+          if (-not (Test-Path $dst)) { throw "action sccache.exe not found at $dst" }
+          Copy-Item -LiteralPath $bin -Destination $dst -Force
+          $v = & $dst --version
+          Write-Host "active sccache: $v"
+          if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: '$v'" }
+
+      - name: Configure sccache wrapper (seed)
+        if: inputs.mode == 'seed'
+        shell: pwsh
+        run: |
+          "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
+          "SCCACHE_GHA_ENABLED=true" >> $env:GITHUB_ENV
+          "SCCACHE_IDLE_TIMEOUT=7200" >> $env:GITHUB_ENV
+
+      - name: Prewarm sccache (seed)
+        if: inputs.mode == 'seed'
+        shell: pwsh
+        run: |
+          & "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch x64 -HostArch x64
+          Set-Location $env:GITHUB_WORKSPACE
+          $env:ZED_RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
+          $env:RELEASE_CHANNEL = $env:ZED_RELEASE_CHANNEL
+          $env:CC = "sccache cl"; $env:CXX = "sccache cl"
+          cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --package auto_update_helper --target x86_64-pc-windows-msvc 2>&1 | Select-Object -Last 3
+        continue-on-error: true
+
+      - name: Bundle Windows (seed)
+        if: inputs.mode == 'seed'
+        shell: pwsh
+        run: script/bundle-windows.ps1 -Architecture x86_64
+        env:
+          ZED_FORK_SKIP_REMOTE_SERVER: "1"
+
+      - name: Save wholestore (seed)
+        if: inputs.mode == 'seed'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ env.WHOLESTORE_KEY }}
+          path: target
+
+      # ---------- measure-only: restore + bundle, no sccache ----------
+      - name: Restore wholestore (measure)
+        if: inputs.mode == 'measure'
+        uses: actions/cache/restore@v4
+        with:
+          key: ${{ env.WHOLESTORE_KEY }}
+          path: target
+
+      - name: Wholestore inspect (measure)
+        if: inputs.mode == 'measure'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "target\x86_64-pc-windows-msvc\release\zed.exe")) {
+            Write-Host "WARNING: restored zed.exe missing - fingerprints will rebuild"
+          }
+          $n = (Get-ChildItem -Recurse -File target -ErrorAction SilentlyContinue | Measure-Object).Count
+          Write-Host "restored files: $n"
+
+      - name: Bundle Windows (measure)
+        if: inputs.mode == 'measure'
+        shell: pwsh
+        run: script/bundle-windows.ps1 -Architecture x86_64
+        env:
+          ZED_FORK_SKIP_REMOTE_SERVER: "1"
+
+      - name: Upload installer
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-Windows-Installer-wholestore-${{ inputs.mode }}
+          path: target/**/*.zip
+          if-no-files-found: ignore
