@@ -54,7 +54,7 @@ diff -ruN a/src/cmdline.rs b/src/cmdline.rs
              } else if matches.get_flag("zero-stats") {
 diff -ruN a/src/commands.rs b/src/commands.rs
 --- a/src/commands.rs	2026-09-21 02:51:04.939376733 +0800
-+++ b/src/commands.rs	2026-09-21 18:16:56.111881418 +0800
++++ b/src/commands.rs	2026-09-21 21:03:02.223122506 +0800
 @@ -35,7 +35,7 @@
  use std::os::unix::process::ExitStatusExt;
  #[cfg(windows)]
@@ -64,7 +64,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
  use std::process;
  use std::sync::Arc;
  use std::time::Duration;
-@@ -740,6 +740,82 @@
+@@ -740,6 +740,102 @@
                  StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
              }
          }
@@ -104,34 +104,54 @@ diff -ruN a/src/commands.rs b/src/commands.rs
 +                        let missing = missing.clone();
 +                        let failed = failed.clone();
 +                        async move {
-+                            match storage.get_raw(&key).await {
-+                                Ok(Some(data)) => {
-+                                    let path = Path::new(&dir)
-+                                        .join(&key[0..1])
-+                                        .join(&key[1..2])
-+                                        .join(&key);
-+                                    if let Some(parent) = path.parent() {
-+                                        let _ = std::fs::create_dir_all(parent);
-+                                    }
-+                                    match std::fs::write(&path, &data[..]) {
-+                                        Ok(()) => {
-+                                            fetched.fetch_add(1, Ordering::Relaxed);
++                            // The GHA cache metadata endpoint throttles hard
++                            // (hundreds of requests/second get 429s), so
++                            // retry transient errors with backoff.
++                            let mut attempts = 0u32;
++                            loop {
++                                attempts += 1;
++                                match storage.get_raw(&key).await {
++                                    Ok(Some(data)) => {
++                                        let path = Path::new(&dir)
++                                            .join(&key[0..1])
++                                            .join(&key[1..2])
++                                            .join(&key);
++                                        if let Some(parent) = path.parent() {
++                                            let _ = std::fs::create_dir_all(parent);
 +                                        }
-+                                        Err(_) => {
-+                                            failed.fetch_add(1, Ordering::Relaxed);
++                                        match std::fs::write(&path, &data[..]) {
++                                            Ok(()) => {
++                                                fetched.fetch_add(1, Ordering::Relaxed);
++                                            }
++                                            Err(_) => {
++                                                failed.fetch_add(1, Ordering::Relaxed);
++                                            }
 +                                        }
++                                        break;
 +                                    }
-+                                }
-+                                Ok(None) => {
-+                                    missing.fetch_add(1, Ordering::Relaxed);
-+                                }
-+                                Err(_) => {
-+                                    failed.fetch_add(1, Ordering::Relaxed);
++                                    Ok(None) => {
++                                        missing.fetch_add(1, Ordering::Relaxed);
++                                        break;
++                                    }
++                                    Err(_) if attempts < 4 => {
++                                        tokio::time::timeout(
++                                            std::time::Duration::from_millis(
++                                                500 * u64::from(attempts),
++                                            ),
++                                            futures::future::ready(()),
++                                        )
++                                        .await
++                                        .ok();
++                                    }
++                                    Err(_) => {
++                                        failed.fetch_add(1, Ordering::Relaxed);
++                                        break;
++                                    }
 +                                }
 +                            }
 +                        }
 +                    })
-+                    .buffer_unordered(32)
++                    .buffer_unordered(16)
 +                    .collect::<Vec<_>>()
 +                    .await;
 +            });
