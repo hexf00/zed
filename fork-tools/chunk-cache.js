@@ -43,8 +43,26 @@ function rmrf(p) {
 }
 
 // DiskCache layout is <store>/<key[0..1]>/<key[1..2]>/<key>; entry files
-// are named by their 64-hex key. Sorted keys make grouping deterministic:
-// the same membership always produces the same chunks on every runner.
+// are named by their 64-hex key.
+function walkStore() {
+  const entries = new Map();
+  if (!fs.existsSync(STORE)) return entries;
+  for (const l0 of fs.readdirSync(STORE, { withFileTypes: true })) {
+    if (!l0.isDirectory()) continue;
+    for (const l1 of fs.readdirSync(path.join(STORE, l0.name), { withFileTypes: true })) {
+      if (!l1.isDirectory()) continue;
+      for (const e of fs.readdirSync(path.join(STORE, l0.name, l1.name), { withFileTypes: true })) {
+        if (e.isFile() && /^[0-9a-f]{64}$/.test(e.name)) {
+          entries.set(e.name, path.join(STORE, l0.name, l1.name, e.name));
+        }
+      }
+    }
+  }
+  return entries;
+}
+
+// Sorted keys make grouping deterministic: the same membership always
+// produces the same chunks on every runner.
 function groupChunks(entries) {
   const chunks = [];
   let group = [];
@@ -92,8 +110,12 @@ async function fetch() {
     );
     return;
   }
-  const cache = require("@actions/cache");
   const index = JSON.parse(fs.readFileSync(INDEX, "utf8"));
+  if (process.env.CHUNK_CACHE_DRYRUN) {
+    console.log(`dryrun: would fetch ${index.chunks.length} chunks`);
+    return;
+  }
+  const cache = require("@actions/cache");
   const missing = [];
   let chunksOk = 0;
   let entriesWritten = 0;
@@ -134,7 +156,7 @@ async function push() {
   if (entries.size === 0) {
     throw new Error(`disk store ${STORE} is empty`);
   }
-  const cache = require("@actions/cache");
+  const cache = process.env.CHUNK_CACHE_DRYRUN ? null : require("@actions/cache");
   const chunks = groupChunks(entries);
   const missing = fs.existsSync(MISSING)
     ? new Set(fs.readFileSync(MISSING, "utf8").split("\n").filter(Boolean))
@@ -148,6 +170,7 @@ async function push() {
   );
   let pushed = 0;
   let reused = 0;
+  const failedKeys = new Set();
   const start = Date.now();
   for (const chunk of chunks) {
     if (known.has(chunk.key)) {
@@ -160,14 +183,24 @@ async function push() {
     for (const key of chunk.members) {
       fs.copyFileSync(entries.get(key), path.join(staging, key));
     }
-    try {
-      await cache.saveCache([staging], chunk.key);
-      pushed += 1;
-    } catch (err) {
-      if (/already exists|Reservation/i.test(String(err.message || err))) {
-        reused += 1;
-      } else {
-        throw err;
+    if (!cache) {
+      console.log(`dryrun: would save ${chunk.key} (${chunk.members.length} entries, ${chunk.bytes} bytes)`);
+    } else {
+      try {
+        await cache.saveCache([staging], chunk.key);
+        pushed += 1;
+      } catch (err) {
+        const msg = String((err && err.message) || err);
+        if (/already exists|Reservation/i.test(msg)) {
+          reused += 1;
+        } else {
+          // One failed chunk must not lose the whole index: exclude it so
+          // the next run re-pushes it.
+          console.log(`save ${chunk.key} failed: ${msg}`);
+          failedKeys.add(chunk.key);
+          rmrf(staging);
+          continue;
+        }
       }
     }
     rmrf(staging);
@@ -179,23 +212,32 @@ async function push() {
   fs.writeFileSync(
     INDEX,
     JSON.stringify(
-      { version: 1, chunks: chunks.map(({ key, members, bytes }) => ({ key, members: members.length, bytes })) },
+      {
+        version: 1,
+        chunks: chunks
+          .filter((c) => !failedKeys.has(c.key))
+          .map(({ key, members, bytes }) => ({ key, members: members.length, bytes })),
+      },
       null,
       1,
     ),
   );
   console.log(
-    `chunk-push: chunks ${chunks.length} pushed ${pushed} reused ${reused} ` +
+    `chunk-push: chunks ${chunks.length} pushed ${pushed} reused ${reused} failed ${failedKeys.size} ` +
       `in ${Math.round((Date.now() - start) / 1000)}s`,
   );
 }
 
-(async () => {
-  const mode = process.argv[2];
-  if (mode === "fetch") await fetch();
-  else if (mode === "push") await push();
-  else throw new Error(`usage: node chunk-cache.js fetch|push (got: ${mode})`);
-})().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  (async () => {
+    const mode = process.argv[2];
+    if (mode === "fetch") await fetch();
+    else if (mode === "push") await push();
+    else throw new Error(`usage: node chunk-cache.js fetch|push (got: ${mode})`);
+  })().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = { walkStore, groupChunks };
