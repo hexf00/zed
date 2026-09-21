@@ -37,7 +37,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  WHOLESTORE_KEY: fork-wholestore-x86_64-v1
+  # v2: entry now also carries ~/.cargo/registry/src — cargo re-extracts
+  # sources on a fresh runner with mtimes=now, which dirties every
+  # third-party unit; restoring the extracted tree (tar preserves mtimes)
+  # keeps the seed-recorded fingerprints valid.
+  WHOLESTORE_KEY: fork-wholestore-x86_64-v2
   CARGO_INCREMENTAL: "0"
   CARGO_BUILD_JOBS: "16"
   GITHUB_RUN_NUMBER: "fork-stable"
@@ -144,6 +148,7 @@ jobs:
           $env:RELEASE_CHANNEL = $env:ZED_RELEASE_CHANNEL
           $env:CC = "sccache cl"; $env:CXX = "sccache cl"
           cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --package auto_update_helper --target x86_64-pc-windows-msvc 2>&1 | Select-Object -Last 3
+          if ($LASTEXITCODE -ne 0) { throw "prewarm cargo failed with $LASTEXITCODE" }
         continue-on-error: true
 
       - name: Bundle Windows (seed)
@@ -158,7 +163,9 @@ jobs:
         uses: actions/cache/save@v4
         with:
           key: ${{ env.WHOLESTORE_KEY }}
-          path: target
+          path: |
+            target
+            ~/.cargo/registry/src
 
       # ---------- measure-only: restore + bundle, no sccache ----------
       - name: Restore wholestore (measure)
@@ -166,7 +173,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           key: ${{ env.WHOLESTORE_KEY }}
-          path: target
+          path: |
+            target
+            ~/.cargo/registry/src
 
       - name: Wholestore inspect (measure)
         if: inputs.mode == 'measure'
@@ -184,6 +193,10 @@ jobs:
         run: script/bundle-windows.ps1 -Architecture x86_64
         env:
           ZED_FORK_SKIP_REMOTE_SERVER: "1"
+          # If fingerprints still miss somewhere, a 16-way local rebuild
+          # OOMs rustc (observed). The measure path should be all-Fresh;
+          # cap the fallback rebuild width.
+          CARGO_BUILD_JOBS: "8"
 
       - name: Upload installer
         if: always()
