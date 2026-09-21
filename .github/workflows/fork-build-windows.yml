@@ -346,8 +346,11 @@ jobs:
       - name: Upload cargo timings
         # Must run AFTER the build: the timing html only exists once cargo
         # finishes. (This step used to sit before the build and silently
-        # uploaded nothing.)
+        # uploaded nothing.) Diagnostic-only: the target/** glob walk can
+        # trip EPERM stat'ing odd build dirs (e.g. webrtc-sys cxxbridge),
+        # which must never fail the run or skip the installer upload.
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: cargo-timings
