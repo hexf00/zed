@@ -89,17 +89,19 @@ jobs:
           key: cargo-registry-windows-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-registry-windows-
 
-      - name: Restore sccache key index
-        # The index is tiny (one 64-hex key per line): it lists every cache
-        # entry known to exist in the GHA namespace. The build's prefetch
-        # step pulls exactly those entries into the local disk store (L0)
-        # at full network width, without cargo's DAG or job cap.
+      - name: Restore sccache chunk index
+        # The chunk index lists content-addressed chunks (each <=64 entries
+        # and <=96 MiB) that together cover every sccache entry known to
+        # exist in the GHA namespace. Restoring it lets the prefetch step
+        # pull the whole store in a few dozen requests instead of ~2000
+        # per-entry lookups, which the GHA cache metadata rate limits
+        # (uploads 200/min, downloads ~1500/min) made slow and flaky.
         uses: actions/cache@v4
         with:
-          path: .sccache-keyindex
-          key: sccache-key-index-x86_64-${{ github.run_id }}
+          path: .sccache-chunkindex
+          key: sccache-chunk-index-x86_64-${{ github.run_id }}
           restore-keys: |
-            sccache-key-index-x86_64-
+            sccache-chunk-index-x86_64-
 
       - name: Restore uncacheable compiler layer
         # sccache hard-refuses build-script bins (CannotCache bin) and
@@ -170,24 +172,24 @@ jobs:
           Write-Host "active sccache: $v"
           if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: '$v'" }
 
-      - name: Prefetch sccache entries via key index
-        # Batch-pull every indexed entry straight into the disk store (L0)
-        # with 32-way concurrency. MUST run before the server starts: the
-        # DiskCache only scans its directory at init, so files written
-        # after startup would be invisible to it.
+      - name: Prefetch sccache entries via chunk index
+        # Pull every indexed chunk and unpack it into the disk store (L0)
+        # with 8-way chunk concurrency. MUST run before the server starts:
+        # the DiskCache only scans its directory at init, so files written
+        # after startup would be invisible to it. A stale chunk in the
+        # index only costs a little prefetch bandwidth; entries missing
+        # from every indexed chunk fall back to the normal per-entry GHA
+        # path during the build.
         shell: pwsh
         run: |
-          $idx = ".sccache-keyindex\keys.txt"
+          $idx = ".sccache-chunkindex\chunks.json"
           if (-not (Test-Path $idx)) {
-            Write-Host "no key index yet - skipping prefetch (first run backfills via GHA)"
+            Write-Host "no chunk index yet - skipping prefetch (bank run backfills via GHA, then pushes chunks)"
             exit 0
           }
           $sccacheExe = ($env:SCCACHE_PATH -replace '/', '\') + '.exe'
-          $env:SCCACHE_MULTILEVEL_CHAIN = "disk,gha"
-          $env:SCCACHE_DIR = "$env:GITHUB_WORKSPACE\.sccache-disk"
-          $env:SCCACHE_CACHE_SIZE = "10G"
-          & $sccacheExe --fork-fetch-keys $idx
-          if ($LASTEXITCODE -ne 0) { throw "fork-fetch-keys failed" }
+          & $sccacheExe --fork-fetch-chunks $idx "$env:GITHUB_WORKSPACE\.sccache-disk"
+          if ($LASTEXITCODE -ne 0) { throw "fork-fetch-chunks failed" }
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
@@ -394,29 +396,39 @@ jobs:
           path: target/**/cargo-timings/*.html
           if-no-files-found: ignore
 
-      - name: Build sccache key index
-        # Union the restored index with every key currently in the disk
-        # store (backfilled or written this run). The store's filenames ARE
-        # the keys. always(): a cancelled run still indexed what it got.
+      - name: Push sccache chunks and merge chunk index
+        # Pack the local disk store (L0) into content-addressed chunks and
+        # push only the ones the GHA backend does not have yet (unchanged
+        # chunks dedupe by key, so an unchanged tree pushes near-zero
+        # bytes). Then union the fresh chunks with the restored index:
+        # chunks are content-addressed, so a key union is safe, and stale
+        # chunks in the index only cost prefetch bandwidth, never
+        # correctness. always(): a cancelled run still banks what it got.
         if: always()
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path .sccache-keyindex | Out-Null
-          $keys = @()
-          if (Test-Path .sccache-keyindex\keys.txt) { $keys += Get-Content .sccache-keyindex\keys.txt }
-          if (Test-Path .sccache-disk) {
-            $keys += Get-ChildItem .sccache-disk -Recurse -File | ForEach-Object { $_.Name }
+          if (-not $env:SCCACHE_PATH) { Write-Host "sccache not installed - skip"; exit 0 }
+          New-Item -ItemType Directory -Force -Path .sccache-chunkindex | Out-Null
+          $sccacheExe = ($env:SCCACHE_PATH -replace '/', '\') + '.exe'
+          & $sccacheExe --fork-push-chunks "$env:GITHUB_WORKSPACE\.sccache-disk" ".sccache-chunkindex\chunks-new.json"
+          if ($LASTEXITCODE -ne 0) { throw "fork-push-chunks failed" }
+          $map = @{}
+          foreach ($f in @(".sccache-chunkindex\chunks.json", ".sccache-chunkindex\chunks-new.json")) {
+            if (Test-Path $f) {
+              $idx = Get-Content $f -Raw | ConvertFrom-Json
+              foreach ($c in $idx.chunks) { $map[$c.key] = $c }
+            }
           }
-          $keys = $keys | Where-Object { $_ -match '^[0-9a-f]{64}$' } | Sort-Object -Unique
-          $keys | Set-Content .sccache-keyindex\keys.txt
-          Write-Host "index keys: $($keys.Count)"
+          [pscustomobject]@{ chunks = @($map.Values) } |
+            ConvertTo-Json -Depth 8 | Set-Content ".sccache-chunkindex\chunks.json"
+          Write-Host "chunk index: $(@($map.Values).Count) chunks"
 
-      - name: Save sccache key index
+      - name: Save sccache chunk index
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .sccache-keyindex
-          key: sccache-key-index-x86_64-${{ github.run_id }}
+          path: .sccache-chunkindex
+          key: sccache-chunk-index-x86_64-${{ github.run_id }}
 
       - name: Save uncacheable compiler layer
         # Persist this run's layer as the newest entry for the next run's
