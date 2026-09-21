@@ -172,24 +172,31 @@ jobs:
           Write-Host "active sccache: $v"
           if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: '$v'" }
 
-      - name: Prefetch sccache entries via chunk index
-        # Pull every indexed chunk and unpack it into the disk store (L0)
-        # with 8-way chunk concurrency. MUST run before the server starts:
-        # the DiskCache only scans its directory at init, so files written
-        # after startup would be invisible to it. A stale chunk in the
-        # index only costs a little prefetch bandwidth; entries missing
-        # from every indexed chunk fall back to the normal per-entry GHA
-        # path during the build.
+      - name: Install chunk transport deps
+        # fork-tools/chunk-cache.js moves sccache store entries through the
+        # GHA cache in content-addressed chunks via @actions/cache (the
+        # library behind actions/cache@v4). Zero checked-in node_modules:
+        # install once per job, reuse in the fetch and push steps.
         shell: pwsh
         run: |
-          $idx = ".sccache-chunkindex\chunks.json"
-          if (-not (Test-Path $idx)) {
-            Write-Host "no chunk index yet - skipping prefetch (bank run backfills via GHA, then pushes chunks)"
-            exit 0
+          npm install --no-audit --no-fund --prefix "$env:RUNNER_TEMP\ccdeps" @actions/cache 2>&1 | Select-Object -Last 1
+          if (-not (Test-Path "$env:RUNNER_TEMP\ccdeps\node_modules\@actions\cache")) {
+            throw "@actions/cache install failed"
           }
-          $sccacheExe = ($env:SCCACHE_PATH -replace '/', '\') + '.exe'
-          & $sccacheExe --fork-fetch-chunks $idx "$env:GITHUB_WORKSPACE\.sccache-disk"
-          if ($LASTEXITCODE -ne 0) { throw "fork-fetch-chunks failed" }
+
+      - name: Prefetch sccache entries via chunk index
+        # Pull every indexed chunk and move its member files into the disk
+        # store (L0). MUST run before the server starts: the DiskCache only
+        # scans its directory at init, so files written after startup would
+        # be invisible to it. A stale chunk in the index only costs a
+        # little prefetch bandwidth; entries missing from every indexed
+        # chunk fall back to the normal per-entry GHA path during the
+        # build.
+        shell: pwsh
+        run: |
+          $env:NODE_PATH = "$env:RUNNER_TEMP\ccdeps\node_modules"
+          node fork-tools/chunk-cache.js fetch
+          if ($LASTEXITCODE -ne 0) { throw "chunk-cache fetch failed" }
 
       - name: Alias VS Community to Enterprise
         # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
@@ -409,30 +416,18 @@ jobs:
         # Pack the local disk store (L0) into content-addressed chunks and
         # push only the ones the GHA backend does not have yet (unchanged
         # chunks dedupe by key, so an unchanged tree pushes near-zero
-        # bytes). Then union the fresh chunks with the restored index:
-        # chunks are content-addressed, so a key union is safe, and stale
-        # chunks in the index only cost prefetch bandwidth, never
-        # correctness. Runs AFTER the installer upload so a failure here
-        # loses only prefetch speed, never the product. always(): a
-        # cancelled run still banks what it got.
+        # bytes). The script also merges the restored index with the fresh
+        # chunk set, pruning chunk keys the fetch step found evicted.
+        # Runs AFTER the installer upload so a failure here loses only
+        # prefetch speed, never the product. always(): a cancelled run
+        # still banks what it got.
         if: always()
         shell: pwsh
         run: |
-          if (-not $env:SCCACHE_PATH) { Write-Host "sccache not installed - skip"; exit 0 }
-          New-Item -ItemType Directory -Force -Path .sccache-chunkindex | Out-Null
-          $sccacheExe = ($env:SCCACHE_PATH -replace '/', '\') + '.exe'
-          & $sccacheExe --fork-push-chunks "$env:GITHUB_WORKSPACE\.sccache-disk" ".sccache-chunkindex\chunks-new.json"
-          if ($LASTEXITCODE -ne 0) { throw "fork-push-chunks failed" }
-          $map = @{}
-          foreach ($f in @(".sccache-chunkindex\chunks.json", ".sccache-chunkindex\chunks-new.json")) {
-            if (Test-Path $f) {
-              $idx = Get-Content $f -Raw | ConvertFrom-Json
-              foreach ($c in $idx.chunks) { $map[$c.key] = $c }
-            }
-          }
-          [pscustomobject]@{ chunks = @($map.Values) } |
-            ConvertTo-Json -Depth 8 | Set-Content ".sccache-chunkindex\chunks.json"
-          Write-Host "chunk index: $(@($map.Values).Count) chunks"
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\.sccache-disk")) { Write-Host "no disk store - skip"; exit 0 }
+          $env:NODE_PATH = "$env:RUNNER_TEMP\ccdeps\node_modules"
+          node fork-tools/chunk-cache.js push
+          if ($LASTEXITCODE -ne 0) { throw "chunk-cache push failed" }
 
       - name: Save sccache chunk index
         if: always()
