@@ -179,7 +179,9 @@ jobs:
         # install once per job, reuse in the fetch and push steps.
         shell: pwsh
         run: |
-          npm install --no-audit --no-fund --prefix "$env:RUNNER_TEMP\ccdeps" @actions/cache 2>&1 | Select-Object -Last 1
+          # Pin major 3: newer @actions/cache is ESM-only and breaks the
+          # CommonJS require in chunk-cache.js (ERR_PACKAGE_PATH_NOT_EXPORTED).
+          npm install --no-audit --no-fund --prefix "$env:RUNNER_TEMP\ccdeps" "@actions/cache@3" 2>&1 | Select-Object -Last 1
           if (-not (Test-Path "$env:RUNNER_TEMP\ccdeps\node_modules\@actions\cache")) {
             throw "@actions/cache install failed"
           }
