@@ -1,6 +1,6 @@
-diff -ruN a/Cargo.toml b/Cargo.toml
---- a/Cargo.toml	2026-09-14 17:50:17.000000000 +0800
-+++ b/Cargo.toml	2026-09-21 02:51:25.752312300 +0800
+diff -ruN rel/a/Cargo.toml rel/b/Cargo.toml
+--- rel/a/Cargo.toml	2026-09-21 23:23:29.077529638 +0800
++++ rel/b/Cargo.toml	2026-09-21 23:23:29.141533300 +0800
 @@ -3,7 +3,7 @@
  edition = "2024"
  name = "sccache"
@@ -10,9 +10,9 @@ diff -ruN a/Cargo.toml b/Cargo.toml
  
  categories = ["command-line-utilities", "development-tools::build-utils"]
  description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible. Sccache has the capability to utilize caching in remote storage environments, including various cloud storage options, or alternatively, in local storage."
-diff -ruN a/src/cmdline.rs b/src/cmdline.rs
---- a/src/cmdline.rs	2026-09-14 17:50:17.000000000 +0800
-+++ b/src/cmdline.rs	2026-09-21 21:44:31.996612288 +0800
+diff -ruN rel/a/src/cmdline.rs rel/b/src/cmdline.rs
+--- rel/a/src/cmdline.rs	2026-09-21 23:23:29.093530553 +0800
++++ rel/b/src/cmdline.rs	2026-09-21 23:23:29.153533987 +0800
 @@ -80,6 +80,25 @@
          env_vars: Vec<(OsString, OsString)>,
      },
@@ -98,9 +98,9 @@ diff -ruN a/src/cmdline.rs b/src/cmdline.rs
              } else if matches.get_flag("stop-server") {
                  Ok(Command::StopServer)
              } else if matches.get_flag("zero-stats") {
-diff -ruN a/src/commands.rs b/src/commands.rs
---- a/src/commands.rs	2026-09-14 17:50:17.000000000 +0800
-+++ b/src/commands.rs	2026-09-21 22:38:40.615185802 +0800
+diff -ruN rel/a/src/commands.rs rel/b/src/commands.rs
+--- rel/a/src/commands.rs	2026-09-21 23:23:29.093530553 +0800
++++ rel/b/src/commands.rs	2026-09-21 23:23:29.153533987 +0800
 @@ -12,7 +12,9 @@
  // See the License for the specific language governing permissions and
  // limitations under the License.
@@ -121,7 +121,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
  use std::process;
  use std::sync::Arc;
  use std::time::Duration;
-@@ -715,6 +717,80 @@
+@@ -715,6 +717,81 @@
      Ok(exit_code)
  }
  
@@ -131,16 +131,17 @@ diff -ruN a/src/commands.rs b/src/commands.rs
 +    config: &Config,
 +    pool: &tokio::runtime::Handle,
 +) -> Result<std::sync::Arc<dyn Storage>> {
-+    let cache = config
++    let cache_type = config
 +        .cache
 +        .as_ref()
 +        .ok_or_else(|| anyhow!("no cache backend configured"))?;
-+    let gha = cache
-+        .gha
-+        .as_ref()
-+        .ok_or_else(|| anyhow!("gha cache is not configured"))?;
-+    let cache_type = crate::config::CacheType::GHA(gha.clone());
-+    build_single_cache(&cache_type, &config.basedirs, pool, config.skip_cache_check)
++    if !matches!(cache_type, crate::config::CacheType::GHA(_)) {
++        bail!(
++            "fork chunk transport requires the plain gha backend - do not set \
++             SCCACHE_MULTILEVEL_CHAIN for this command"
++        );
++    }
++    build_single_cache(cache_type, &config.basedirs, pool, config.skip_cache_check)
 +}
 +
 +#[derive(serde::Serialize, serde::Deserialize)]
@@ -202,7 +203,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
  /// Run `cmd` and return the process exit status.
  pub fn run_command(cmd: Command) -> Result<i32> {
      // Config isn't required for all commands, but if it's broken then we should flag
-@@ -740,6 +816,321 @@
+@@ -740,6 +817,323 @@
                  StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
              }
          }
@@ -213,6 +214,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
 +            // chunk index JSON. The GHA cache metadata endpoint throttles
 +            // per-repo (uploads: 200/min, downloads: ~1500/min), which is
 +            // exactly why entries travel in chunks.
++            use futures::StreamExt;
 +            use std::collections::BTreeMap;
 +            use std::sync::atomic::{AtomicUsize, Ordering};
 +
@@ -334,6 +336,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
 +            // present are skipped.
 +            use std::sync::atomic::{AtomicUsize, Ordering};
 +
++            use futures::StreamExt;
 +            let runtime = new_client_runtime()?;
 +            let gha = fork_gha_storage(config, runtime.handle())?;
 +            let index_json = fs::read_to_string(&index)?;
@@ -524,9 +527,9 @@ diff -ruN a/src/commands.rs b/src/commands.rs
          Command::DebugPreprocessorCacheEntries => {
              trace!("Command::DebugPreprocessorCacheEntries");
              let entries_dir = default_disk_cache_dir().join("preprocessor");
-diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
---- a/src/compiler/rust.rs	2026-09-14 17:50:17.000000000 +0800
-+++ b/src/compiler/rust.rs	2026-09-21 05:52:04.765224855 +0800
+diff -ruN rel/a/src/compiler/rust.rs rel/b/src/compiler/rust.rs
+--- rel/a/src/compiler/rust.rs	2026-09-21 23:23:29.097530782 +0800
++++ rel/b/src/compiler/rust.rs	2026-09-21 23:23:29.157534217 +0800
 @@ -26,7 +26,10 @@
  #[cfg(feature = "dist-client")]
  use crate::lru_disk_cache::{LruCache, Meter};
@@ -640,9 +643,9 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
              compilation: Box::new(RustCompilation {
                  executable: self.executable.clone(),
                  host: self.host.clone(),
-diff -ruN a/src/util.rs b/src/util.rs
---- a/src/util.rs	2026-09-14 17:50:17.000000000 +0800
-+++ b/src/util.rs	2026-09-21 06:27:51.156377901 +0800
+diff -ruN rel/a/src/util.rs rel/b/src/util.rs
+--- rel/a/src/util.rs	2026-09-21 23:23:29.105531240 +0800
++++ rel/b/src/util.rs	2026-09-21 23:23:29.165534674 +0800
 @@ -455,6 +455,213 @@
      Ok(())
  }
