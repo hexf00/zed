@@ -100,7 +100,7 @@ diff -ruN a/src/cmdline.rs b/src/cmdline.rs
              } else if matches.get_flag("zero-stats") {
 diff -ruN a/src/commands.rs b/src/commands.rs
 --- a/src/commands.rs	2026-09-14 17:50:17.000000000 +0800
-+++ b/src/commands.rs	2026-09-22 00:07:28.042700460 +0800
++++ b/src/commands.rs	2026-09-22 01:54:42.433424290 +0800
 @@ -12,7 +12,9 @@
  // See the License for the specific language governing permissions and
  // limitations under the License.
@@ -203,7 +203,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
  /// Run `cmd` and return the process exit status.
  pub fn run_command(cmd: Command) -> Result<i32> {
      // Config isn't required for all commands, but if it's broken then we should flag
-@@ -740,6 +817,325 @@
+@@ -740,6 +817,334 @@
                  StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
              }
          }
@@ -221,12 +221,21 @@ diff -ruN a/src/commands.rs b/src/commands.rs
 +            let runtime = new_client_runtime()?;
 +            let gha = fork_gha_storage(config, runtime.handle())?;
 +            let mut entries: BTreeMap<String, PathBuf> = BTreeMap::new();
-+            for shard in fs::read_dir(&store).with_context(|| {
++            // DiskCache layout is <store>/<key[0..1]>/<key[1..2]>/<key>
++            // (make_key_path): walk all three levels, collect entry files.
++            for l0 in fs::read_dir(&store).with_context(|| {
 +                format!("Failed to read disk store dir {}", store.display())
 +            })? {
-+                let shard = shard?;
-+                if shard.file_type()?.is_dir() {
-+                    for e in fs::read_dir(shard.path())? {
++                let l0 = l0?;
++                if !l0.file_type()?.is_dir() {
++                    continue;
++                }
++                for l1 in fs::read_dir(l0.path())? {
++                    let l1 = l1?;
++                    if !l1.file_type()?.is_dir() {
++                        continue;
++                    }
++                    for e in fs::read_dir(l1.path())? {
 +                        let e = e?;
 +                        let name = e.file_name().to_string_lossy().to_string();
 +                        if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {

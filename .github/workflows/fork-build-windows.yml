@@ -396,6 +396,15 @@ jobs:
           path: target/**/cargo-timings/*.html
           if-no-files-found: ignore
 
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-Windows-Installer-${{ inputs.architecture || 'x86_64' }}
+          path: |
+            target/Zed-*.exe
+            target/ZedEditorUserSetup-*.exe
+          if-no-files-found: error
+
       - name: Push sccache chunks and merge chunk index
         # Pack the local disk store (L0) into content-addressed chunks and
         # push only the ones the GHA backend does not have yet (unchanged
@@ -403,7 +412,9 @@ jobs:
         # bytes). Then union the fresh chunks with the restored index:
         # chunks are content-addressed, so a key union is safe, and stale
         # chunks in the index only cost prefetch bandwidth, never
-        # correctness. always(): a cancelled run still banks what it got.
+        # correctness. Runs AFTER the installer upload so a failure here
+        # loses only prefetch speed, never the product. always(): a
+        # cancelled run still banks what it got.
         if: always()
         shell: pwsh
         run: |
@@ -459,12 +470,3 @@ jobs:
           name: sccache-error-log
           path: ${{ runner.temp }}/sccache-error.log
           if-no-files-found: ignore
-
-      - name: Upload installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: Zed-Windows-Installer-${{ inputs.architecture || 'x86_64' }}
-          path: |
-            target/Zed-*.exe
-            target/ZedEditorUserSetup-*.exe
-          if-no-files-found: error
