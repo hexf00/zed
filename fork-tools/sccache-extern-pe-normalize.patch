@@ -1,6 +1,6 @@
-diff -ruN a/Cargo.toml b/Cargo.toml
---- a/Cargo.toml	2026-09-14 17:50:17.000000000 +0800
-+++ b/Cargo.toml	2026-09-21 02:51:25.752312300 +0800
+diff -ruN /tmp/a/Cargo.toml /tmp/b/Cargo.toml
+--- /tmp/a/Cargo.toml	2026-09-14 17:50:17.000000000 +0800
++++ /tmp/b/Cargo.toml	2026-09-21 02:51:25.752312300 +0800
 @@ -3,7 +3,7 @@
  edition = "2024"
  name = "sccache"
@@ -10,9 +10,9 @@ diff -ruN a/Cargo.toml b/Cargo.toml
  
  categories = ["command-line-utilities", "development-tools::build-utils"]
  description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible. Sccache has the capability to utilize caching in remote storage environments, including various cloud storage options, or alternatively, in local storage."
-diff -ruN a/src/cmdline.rs b/src/cmdline.rs
---- a/src/cmdline.rs	2026-09-14 17:50:17.000000000 +0800
-+++ b/src/cmdline.rs	2026-09-21 21:44:31.996612288 +0800
+diff -ruN /tmp/a/src/cmdline.rs /tmp/b/src/cmdline.rs
+--- /tmp/a/src/cmdline.rs	2026-09-14 17:50:17.000000000 +0800
++++ /tmp/b/src/cmdline.rs	2026-09-21 21:44:31.996612288 +0800
 @@ -80,6 +80,25 @@
          env_vars: Vec<(OsString, OsString)>,
      },
@@ -98,9 +98,9 @@ diff -ruN a/src/cmdline.rs b/src/cmdline.rs
              } else if matches.get_flag("stop-server") {
                  Ok(Command::StopServer)
              } else if matches.get_flag("zero-stats") {
-diff -ruN a/src/commands.rs b/src/commands.rs
---- a/src/commands.rs	2026-09-14 17:50:17.000000000 +0800
-+++ b/src/commands.rs	2026-09-21 21:46:25.258154741 +0800
+diff -ruN /tmp/a/src/commands.rs /tmp/b/src/commands.rs
+--- /tmp/a/src/commands.rs	2026-09-14 17:50:17.000000000 +0800
++++ /tmp/b/src/commands.rs	2026-09-21 21:58:54.680388961 +0800
 @@ -12,7 +12,9 @@
  // See the License for the specific language governing permissions and
  // limitations under the License.
@@ -238,7 +238,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
 +
 +            const MAX_ENTRIES: usize = 64;
 +            const MAX_BYTES: u64 = 96 * 1024 * 1024;
-+            let mut chunks: Vec<Chunk> = Vec::new();
++            let mut chunks: Vec<ForkChunk> = Vec::new();
 +            let mut group: Vec<(String, PathBuf, u64)> = Vec::new();
 +            let mut group_bytes = 0u64;
 +            for (key, path) in &entries {
@@ -523,9 +523,9 @@ diff -ruN a/src/commands.rs b/src/commands.rs
          Command::DebugPreprocessorCacheEntries => {
              trace!("Command::DebugPreprocessorCacheEntries");
              let entries_dir = default_disk_cache_dir().join("preprocessor");
-diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
---- a/src/compiler/rust.rs	2026-09-14 17:50:17.000000000 +0800
-+++ b/src/compiler/rust.rs	2026-09-21 05:52:04.765224855 +0800
+diff -ruN /tmp/a/src/compiler/rust.rs /tmp/b/src/compiler/rust.rs
+--- /tmp/a/src/compiler/rust.rs	2026-09-14 17:50:17.000000000 +0800
++++ /tmp/b/src/compiler/rust.rs	2026-09-21 05:52:04.765224855 +0800
 @@ -26,7 +26,10 @@
  #[cfg(feature = "dist-client")]
  use crate::lru_disk_cache::{LruCache, Meter};
@@ -639,9 +639,9 @@ diff -ruN a/src/compiler/rust.rs b/src/compiler/rust.rs
              compilation: Box::new(RustCompilation {
                  executable: self.executable.clone(),
                  host: self.host.clone(),
-diff -ruN a/src/util.rs b/src/util.rs
---- a/src/util.rs	2026-09-14 17:50:17.000000000 +0800
-+++ b/src/util.rs	2026-09-21 06:27:51.156377901 +0800
+diff -ruN /tmp/a/src/util.rs /tmp/b/src/util.rs
+--- /tmp/a/src/util.rs	2026-09-14 17:50:17.000000000 +0800
++++ /tmp/b/src/util.rs	2026-09-21 06:27:51.156377901 +0800
 @@ -455,6 +455,213 @@
      Ok(())
  }
