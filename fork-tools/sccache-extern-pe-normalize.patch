@@ -54,7 +54,7 @@ diff -ruN a/src/cmdline.rs b/src/cmdline.rs
              } else if matches.get_flag("zero-stats") {
 diff -ruN a/src/commands.rs b/src/commands.rs
 --- a/src/commands.rs	2026-09-21 02:51:04.939376733 +0800
-+++ b/src/commands.rs	2026-09-21 17:54:54.873732311 +0800
++++ b/src/commands.rs	2026-09-21 18:06:42.201569243 +0800
 @@ -35,7 +35,7 @@
  use std::os::unix::process::ExitStatusExt;
  #[cfg(windows)]
@@ -68,7 +68,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
                  StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
              }
          }
-+        Command::ForkFetchKeys { index } => {
++        Command::ForkFetchKeys(index) => {
 +            // FORK: batch-fetch cache entries listed in `index` (one 64-hex
 +            // key per line) into the local disk store (L0) through the
 +            // configured storage backend, concurrently and independently of
@@ -138,7 +138,7 @@ diff -ruN a/src/commands.rs b/src/commands.rs
 +                failed.load(Ordering::Relaxed),
 +                start.elapsed().as_secs()
 +            );
-+            Ok(0)
++            return Ok(0);
 +        }
          Command::DebugPreprocessorCacheEntries => {
              trace!("Command::DebugPreprocessorCacheEntries");
