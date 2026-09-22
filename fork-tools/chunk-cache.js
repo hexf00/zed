@@ -35,8 +35,18 @@ async function loadCache() {
   return import("@actions/cache");
 }
 
-const MAX_ENTRIES = 16;
-const MAX_BYTES = 32 * 1024 * 1024;
+// Chunking scheme v2: content-anchored cuts. A chunk ends after a key whose
+// sha256 starts with 0000xxxx (~1/16 of keys), so cut positions depend on
+// individual keys, not running counts: inserting N keys re-chunks ~N chunks
+// instead of every chunk after the first insertion (the fixed-16 sequential
+// scheme made a 14-entry drift re-push ~160 chunks). Hard caps are a safety
+// net for anchor-free stretches. SCHEME prefixes every chunk key; bumping it
+// invalidates all chunks at once (old keys are pruned from the index on the
+// next push, so old and new schemes never co-pull).
+const SCHEME = "v2-";
+const ANCHOR_MASK = 0xf0;
+const MAX_ENTRIES = 24;
+const MAX_BYTES = 48 * 1024 * 1024;
 const WORKSPACE = process.env.GITHUB_WORKSPACE || process.cwd();
 const STORE = path.join(WORKSPACE, ".sccache-disk");
 const INDEX_DIR = path.join(WORKSPACE, ".sccache-chunkindex");
@@ -54,8 +64,7 @@ function rmrf(p) {
 
 // DiskCache layout is <store>/<key[0..1]>/<key[1..2]>/<key>; entry files
 // are named by their 64-hex key.
-function walkStore() {
-  const entries = new Map();
+function walkStore() {  const entries = new Map();
   if (!fs.existsSync(STORE)) return entries;
   for (const l0 of fs.readdirSync(STORE, { withFileTypes: true })) {
     if (!l0.isDirectory()) continue;
@@ -73,29 +82,32 @@ function walkStore() {
 
 // Sorted keys make grouping deterministic: the same membership always
 // produces the same chunks on every runner.
+function isAnchor(key) {
+  return (crypto.createHash("sha256").update(key).digest()[0] & ANCHOR_MASK) === 0;
+}
+
 function groupChunks(entries) {
   const chunks = [];
   let group = [];
   let bytes = 0;
-  for (const key of [...entries.keys()].sort()) {
-    group.push(key);
-    bytes += fs.statSync(entries.get(key)).size;
-    if (group.length >= MAX_ENTRIES || bytes >= MAX_BYTES) {
-      chunks.push({
-        key: crypto.createHash("sha256").update(group.join("\n")).digest("hex"),
-        members: group.slice(),
-        bytes,
-      });
-      group = [];
-      bytes = 0;
-    }
-  }
-  if (group.length) {
+  const cut = () => {
     chunks.push({
-      key: crypto.createHash("sha256").update(group.join("\n")).digest("hex"),
+      key: SCHEME + crypto.createHash("sha256").update(group.join("\n")).digest("hex"),
       members: group.slice(),
       bytes,
     });
+    group = [];
+    bytes = 0;
+  };
+  for (const key of [...entries.keys()].sort()) {
+    group.push(key);
+    bytes += fs.statSync(entries.get(key)).size;
+    if (isAnchor(key) || group.length >= MAX_ENTRIES || bytes >= MAX_BYTES) {
+      cut();
+    }
+  }
+  if (group.length) {
+    cut();
   }
   return chunks;
 }
@@ -121,8 +133,12 @@ async function fetch() {
     return;
   }
   const index = JSON.parse(fs.readFileSync(INDEX, "utf8"));
+  // Chunks from an older scheme are pruned on the next push; never pull them.
+  const current = index.chunks.filter((c) => c.key.startsWith(SCHEME));
+  const stale = index.chunks.length - current.length;
+  if (stale > 0) console.log(`skipping ${stale} chunks from an older scheme`);
   if (process.env.CHUNK_CACHE_DRYRUN) {
-    console.log(`dryrun: would fetch ${index.chunks.length} chunks`);
+    console.log(`dryrun: would fetch ${current.length} chunks`);
     return;
   }
   const cache = await loadCache();
@@ -132,12 +148,12 @@ async function fetch() {
   const start = Date.now();
 
   // Independent staging dirs per chunk: safe to restore in parallel; the
-  // wall time of ~145 chunk downloads drops roughly by the pool size.
-  const CONCURRENCY = 8;
+  // wall time of ~260 chunk downloads drops roughly by the pool size.
+  const CONCURRENCY = 16;
   let cursor = 0;
   async function worker() {
-    while (cursor < index.chunks.length) {
-      const chunk = index.chunks[cursor++];
+    while (cursor < current.length) {
+      const chunk = current[cursor++];
       const staging = stagingDir(chunk.key);
       rmrf(staging);
       fs.mkdirSync(staging, { recursive: true });
@@ -166,7 +182,7 @@ async function fetch() {
   fs.mkdirSync(INDEX_DIR, { recursive: true });
   fs.writeFileSync(MISSING, missing.sort().join("\n"));
   console.log(
-    `chunk-fetch: chunks ${index.chunks.length} ok ${chunksOk} missing ${missing.length} ` +
+    `chunk-fetch: chunks ${current.length} ok ${chunksOk} missing ${missing.length} ` +
       `entries written ${entriesWritten} in ${Math.round((Date.now() - start) / 1000)}s`,
   );
 }
@@ -185,7 +201,7 @@ async function push() {
     fs.existsSync(INDEX)
       ? JSON.parse(fs.readFileSync(INDEX, "utf8"))
           .chunks.map((c) => c.key)
-          .filter((k) => !missing.has(k))
+          .filter((k) => k.startsWith(SCHEME) && !missing.has(k))
       : [],
   );
   let pushed = 0;
