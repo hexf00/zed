@@ -385,7 +385,16 @@ $debugStoreKey = "$env:ZED_RELEASE_CHANNEL/zed-$env:RELEASE_VERSION-$env:ZED_REL
 
 CheckEnvironmentVariables
 PrepareForBundle
-GenerateLicenses
+# fork: licenses generation needs cargo-about install + full-graph scan
+# (~6min measured); it only serves distribution attribution, which a
+# self-use build has no obligation for. Skipped when ZED_FORK_SKIP_LICENSES
+# is set; unset = upstream behavior. The app's "Open Source License
+# Attribution" page will be empty.
+if (-not $env:ZED_FORK_SKIP_LICENSES) {
+    GenerateLicenses
+} else {
+    Write-Output "Skipping licenses generation (ZED_FORK_SKIP_LICENSES is set)"
+}
 BuildZedAndItsFriends
 # fork: allow skipping remote_server (largest non-editor product); unset = upstream behavior
 if (-not $env:ZED_FORK_SKIP_REMOTE_SERVER) {

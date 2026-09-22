@@ -73,6 +73,11 @@ jobs:
       # the largest non-editor product we never use. Requires the matching
       # fork: commit in script/bundle-windows.ps1 on the custom branch.
       ZED_FORK_SKIP_REMOTE_SERVER: "1"
+      # Skip licenses generation (cargo-about install + full-graph scan,
+      # ~6min measured): serves distribution attribution only, which a
+      # self-use build has no obligation for. Requires the matching fork
+      # guard in script/bundle-windows.ps1 (custom branch).
+      ZED_FORK_SKIP_LICENSES: "1"
       # zed/cli build.rs embeds this via option_env! (ZED_BUILD_ID) and
       # declares rerun-if-env-changed on it. The real per-run number made
       # zed's sccache key drift every run (22min recompile); a stable
