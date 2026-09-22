@@ -61,6 +61,10 @@ jobs:
       # per link (measured 18s with debug=0) and is never shipped anyway.
       # Flip back to "limited" only when a PDB is needed for dumps.
       CARGO_PROFILE_RELEASE_DEBUG: "0"
+      # User-approved tradeoff (2026-09-22): drop cross-crate LTO. Measured
+      # (run 35697097161): terminal cli+zed codegen 20-31min with noise ->
+      # ~9min; full cold rebuild 98min -> 44m49s. Runtime perf loss accepted.
+      CARGO_PROFILE_RELEASE_LTO: "false"
       SCCACHE_GHA_ENABLED: "true"
       # sccache servers idle-exit after 10min by default; the big build
       # starts compiling well after the canary finished, keep it alive.
