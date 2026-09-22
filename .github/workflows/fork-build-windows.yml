@@ -248,7 +248,11 @@ jobs:
           "SCCACHE_ERROR_LOG=$env:RUNNER_TEMP\sccache-error.log" >> $env:GITHUB_ENV
           # Multilevel cache: local disk store L0, GHA L2, auto-backfill on
           # GHA hits. Inline (not GITHUB_ENV): the server starting below
-          # must be born with these.
+          # must be born with these. SCCACHE_ERROR_LOG must ALSO be inline:
+          # GITHUB_ENV only reaches later steps, and a server born without
+          # it logs nowhere (production runs silently produced no server
+          # log for weeks).
+          $env:SCCACHE_ERROR_LOG = "$env:RUNNER_TEMP\sccache-error.log"
           $env:SCCACHE_MULTILEVEL_CHAIN = "disk,gha"
           $env:SCCACHE_DIR = "$env:GITHUB_WORKSPACE\.sccache-disk"
           $env:SCCACHE_CACHE_SIZE = "10G"
