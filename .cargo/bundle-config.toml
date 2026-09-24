@@ -1,3 +1,37 @@
+[env]
+RUSTC_BOOTSTRAP = "1"
+
+# NOTE: [build] rustflags is DEAD here — .cargo/config.toml sets
+# [target.'cfg(target_os = "windows")'] rustflags, and cargo rules say
+# target rustflags fully override build rustflags. All Windows rustflags
+# therefore live in the target section below (highest priority via
+# --config), carrying upstream's flags plus the fork additions.
+[target.'cfg(target_os = "windows")']
+rustflags = [
+    "-Z", "share-generics=y",
+    "--cfg", "windows_slim_errors",
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=/Brepro",
+]
+
+# Proc-macros and build scripts are HOST artifacts under --target: the
+# target section above never applies to them, so their dll/exe kept a
+# wall-clock PE timestamp (COFF header + 3 debug-directory entries) and a
+# PDB Age counter, and every relink produced different bytes. Every crate
+# that --extern's a proc-macro dll then got a fresh sccache key each run
+# (~250 first-party crates). cargo source (extra_args /
+# host_artifact_uses_only_host_config) rules out every rustflags channel
+# on stable: with --target, host artifacts read ONLY the nightly-gated
+# [host] table and fall through to EMPTY — RUSTFLAGS env, [target.*] and
+# [build] are all unreachable for them. Linker options are no fix either:
+# /Brepro hashes its inputs including rustc's per-invocation random temp
+# paths (dll still varies), and /TIMESTAMP:0 via the MSVC LINK env var is
+# silently ignored. The fix lives in the forked sccache instead: it zeroes
+# these PE bytes before hashing --extern files
+# (fork-tools/sccache-extern-pe-normalize.patch, version 0.18.0-fork.1).
+
+# Linux sections carried from upstream (this fork only builds Windows, but
+# keeping upstream's sections shrinks the fork diff for free).
 [target.'cfg(target_os = "linux")']
 rustflags = ["-C", "link-args=-Wl,--disable-new-dtags,-rpath,$ORIGIN/../lib"]
 

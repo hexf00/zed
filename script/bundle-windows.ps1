@@ -116,7 +116,7 @@ function GenerateLicenses {
 function BuildZedAndItsFriends {
     Write-Output "Building Zed and its friends, for channel: $channel"
     # Build zed.exe, cli.exe and auto_update_helper.exe
-    cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --package auto_update_helper --target $target
+    cargo --config .cargo/bundle-config.toml build --timings --release --package zed --package cli --package auto_update_helper --target $target
     Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\Zed.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
@@ -159,10 +159,12 @@ function ZipZedAndItsFriendsDebug {
         ".\$CargoOutDir\zed.pdb",
         ".\$CargoOutDir\cli.pdb",
         ".\$CargoOutDir\auto_update_helper.pdb",
-        ".\$CargoOutDir\explorer_command_injector.pdb",
-        ".\$CargoOutDir\remote_server.pdb"
+        ".\$CargoOutDir\explorer_command_injector.pdb"
     )
-
+    # fork: remote_server is skipped when ZED_FORK_SKIP_REMOTE_SERVER is set
+    if (-not $env:ZED_FORK_SKIP_REMOTE_SERVER) {
+        $items += ".\$CargoOutDir\remote_server.pdb"
+    }
     Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
 }
 
@@ -384,9 +386,23 @@ $debugStoreKey = "$env:ZED_RELEASE_CHANNEL/zed-$env:RELEASE_VERSION-$env:ZED_REL
 
 CheckEnvironmentVariables
 PrepareForBundle
-GenerateLicenses
+# fork: licenses generation needs cargo-about install + full-graph scan
+# (~6min measured); it only serves distribution attribution, which a
+# self-use build has no obligation for. Skipped when ZED_FORK_SKIP_LICENSES
+# is set; unset = upstream behavior. The app's "Open Source License
+# Attribution" page will be empty.
+if (-not $env:ZED_FORK_SKIP_LICENSES) {
+    GenerateLicenses
+} else {
+    Write-Output "Skipping licenses generation (ZED_FORK_SKIP_LICENSES is set)"
+}
 BuildZedAndItsFriends
-BuildRemoteServer
+# fork: allow skipping remote_server (largest non-editor product); unset = upstream behavior
+if (-not $env:ZED_FORK_SKIP_REMOTE_SERVER) {
+    BuildRemoteServer
+} else {
+    Write-Output "Skipping remote_server build (ZED_FORK_SKIP_REMOTE_SERVER is set)"
+}
 MakeAppx
 SignZedAndItsFriends
 ZipZedAndItsFriendsDebug

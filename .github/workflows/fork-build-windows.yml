@@ -1,0 +1,480 @@
+# Fork-only workflow: build a personal Zed for Windows.
+# Upstream's release.yml is gated to zed-industries and left untouched;
+# this file is additive so upstream merges stay conflict-free.
+#
+# Caching model (crate-granular, two layers — no whole-installer snapshot):
+#   1. sccache: per-crate compilation products (GHA backend).
+#   2. cargo registry cache: dependency sources.
+# Every run recompiles nothing that sccache has seen, then always relinks
+# and repackages: the installer is a fresh product of this run.
+name: Fork Windows Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Target CPU architecture
+        type: choice
+        default: x86_64
+        options:
+          - x86_64
+          - aarch64
+      expect_warm_cache:
+        description: Fail fast when Rust/C hit rates miss threshold (false = bank run)
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
+  # Manual-only by design: cold/warm builds are hours long, so nothing
+  # triggers them implicitly. Public repos get free unlimited Actions
+  # minutes; the only cap is 6h per job (timeout below leaves headroom).
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: fork-build-windows-${{ github.ref }}
+  # Canceling is cheap with sccache: finished crate compilations are
+  # already persisted, only in-flight work is lost.
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # Cold 4-core release build (expect ~2h slimmed); with a warm sccache
+    # the unchanged crates replay in minutes and only the relink plus
+    # packaging remain.
+    timeout-minutes: 350
+    env:
+      CARGO_INCREMENTAL: "0"
+      # Per-request server log: decomposes pull time (hash vs GHA fetch)
+      # into SCCACHE_ERROR_LOG, uploaded as an artifact for analysis.
+      SCCACHE_LOG: "debug"
+      # Concurrent cache pulls: every replay hit is a sccache lookup driven
+      # by cargo's job count, so 16 jobs pull the store 16-way instead of
+      # 4-way (~1min for the full store on warm runs). Real compiles are
+      # CPU-bound and unaffected apart from oversubscription.
+      CARGO_BUILD_JOBS: "16"
+      # No debuginfo in fork builds: the ~2GB line-table PDB cost ~31min
+      # per link (measured 18s with debug=0) and is never shipped anyway.
+      # Flip back to "limited" only when a PDB is needed for dumps.
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      # User-approved tradeoff (2026-09-22): drop cross-crate LTO. Measured
+      # (run 35697097161): terminal cli+zed codegen 20-31min with noise ->
+      # ~9min; full cold rebuild 98min -> 44m49s. Runtime perf loss accepted.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      SCCACHE_GHA_ENABLED: "true"
+      # sccache servers idle-exit after 10min by default; the big build
+      # starts compiling well after the canary finished, keep it alive.
+      SCCACHE_IDLE_TIMEOUT: "7200"
+      # Fork slimming (see docs/fork-maintenance.md): skip remote_server,
+      # the largest non-editor product we never use. Requires the matching
+      # fork: commit in script/bundle-windows.ps1 on the custom branch.
+      ZED_FORK_SKIP_REMOTE_SERVER: "1"
+      # Skip licenses generation (cargo-about install + full-graph scan,
+      # ~6min measured): serves distribution attribution only, which a
+      # self-use build has no obligation for. Requires the matching fork
+      # guard in script/bundle-windows.ps1 (custom branch).
+      ZED_FORK_SKIP_LICENSES: "1"
+      # zed/cli build.rs embeds this via option_env! (ZED_BUILD_ID) and
+      # declares rerun-if-env-changed on it. The real per-run number made
+      # zed's sccache key drift every run (22min recompile); a stable
+      # value keeps first-party keys stable. Self-use fork: the build id
+      # is display-only metadata.
+      GITHUB_RUN_NUMBER: "fork-stable"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-windows-
+
+      - name: Restore sccache chunk index
+        # The chunk index lists content-addressed chunks (each <=64 entries
+        # and <=96 MiB) that together cover every sccache entry known to
+        # exist in the GHA namespace. Restoring it lets the prefetch step
+        # pull the whole store in a few dozen requests instead of ~2000
+        # per-entry lookups, which the GHA cache metadata rate limits
+        # (uploads 200/min, downloads ~1500/min) made slow and flaky.
+        uses: actions/cache@v4
+        with:
+          path: .sccache-chunkindex
+          key: sccache-chunk-index-x86_64-${{ github.run_id }}
+          restore-keys: |
+            sccache-chunk-index-x86_64-
+
+      - name: Restore uncacheable compiler layer
+        # sccache hard-refuses build-script bins (CannotCache bin) and
+        # proc-macro crates (CannotCache proc-macro); they recompile every
+        # run and their varying artifacts cascade ~250 first-party crates
+        # into misses. Persist exactly that layer (build-script outputs,
+        # proc-macro dlls, fingerprints) so cargo skips it and sccache
+        # keys downstream stay stable. Keys roll forward on
+        # Cargo.lock/toolchain changes; entries stay per-run unique.
+        uses: actions/cache/restore@v4
+        with:
+          # build scripts and proc-macros are HOST artifacts: with --target
+          # they live in target/release (no triple), NOT the triple dir.
+          path: |
+            target/release/build
+            target/release/deps/*.dll
+            target/release/deps/*.exe
+            target/release/.fingerprint
+            target/x86_64-pc-windows-msvc/release/build
+            target/x86_64-pc-windows-msvc/release/.fingerprint
+          key: uncacheable-layer-x86_64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            uncacheable-layer-x86_64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            uncacheable-layer-x86_64-
+
+      - name: Setup sccache
+        # v0.0.11 exports the cache-service env that modern sccache GHA
+        # backends require (v0.0.9 + pinned sccache 0.9.x failed server
+        # startup with "ACTIONS_CACHE_URL not found").
+        # version pinned: sccache scopes its GHA entries by its own
+        # version, so an unpinned "latest" would silently invalidate the
+        # entire cache whenever upstream releases.
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      - name: Restore fork sccache
+        uses: actions/cache@v4
+        id: fork-sccache
+        with:
+          path: ${{ runner.temp }}/sccache-fork
+          key: sccache-fork-0.18.0-fork.1-${{ hashFiles('fork-tools/*.patch') }}
+
+      - name: Install fork sccache
+        # Overwrite the action-downloaded binary before the server starts.
+        # The fork zeroes link-time-volatile PE bytes (COFF/debug/export
+        # timestamps, RSDS GUID + PDB age, REPRO hashes) when hashing
+        # --extern files, so downstream first-party keys stay stable across
+        # builds even though proc-macro dlls are re-linked every run.
+        shell: pwsh
+        run: |
+          $bin = Join-Path $env:RUNNER_TEMP "sccache-fork\sccache.exe"
+          if (-not (Test-Path $bin)) {
+            throw "fork sccache binary not in GHA cache - dispatch 'Fork sccache build' once, then rerun"
+          }
+          # SCCACHE_PATH itself is extensionless ("...\x64/sccache"), and
+          # Windows appends .exe when CreateProcess/cmd resolve it — so the
+          # binary that actually runs is "<SCCACHE_PATH>.exe". Overwrite THAT
+          # file, not the extensionless one.
+          $dst = ($env:SCCACHE_PATH -replace '/', '\') + '.exe'
+          if (-not (Test-Path $dst)) { throw "action sccache.exe not found at $dst" }
+          Copy-Item -LiteralPath $bin -Destination $dst -Force
+          $dstHash = (Get-FileHash $dst -Algorithm SHA256).Hash
+          Write-Host "destination hash: $dstHash"
+          $srcHash = (Get-FileHash $bin -Algorithm SHA256).Hash
+          if ($dstHash -ne $srcHash) { throw "fork sccache copy failed (hash mismatch)" }
+          $v = & $dst --version
+          Write-Host "active sccache: $v"
+          if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: '$v'" }
+
+      - name: Install chunk transport deps
+        # fork-tools/chunk-cache.js moves sccache store entries through the
+        # GHA cache in content-addressed chunks via @actions/cache (the
+        # library behind actions/cache@v4). The modern major is ESM-only
+        # and restores over the V2 cache service; the old v3 library
+        # restored over the retired V1 service and silently missed every
+        # entry. Deps install into fork-tools/node_modules (gitignored).
+        shell: pwsh
+        run: |
+          npm install --no-audit --no-fund --prefix fork-tools "@actions/cache@6.2.0"
+          if (-not (Test-Path "fork-tools\node_modules\@actions\cache")) {
+            throw "@actions/cache install failed"
+          }
+
+      - name: Prefetch sccache entries via chunk index
+        # Pull every indexed chunk and move its member files into the disk
+        # store (L0). MUST run before the server starts: the DiskCache only
+        # scans its directory at init, so files written after startup would
+        # be invisible to it. A stale chunk in the index only costs a
+        # little prefetch bandwidth; entries missing from every indexed
+        # chunk fall back to the normal per-entry GHA path during the
+        # build.
+        shell: pwsh
+        run: |
+          node fork-tools/chunk-cache.js fetch
+          if ($LASTEXITCODE -ne 0) { throw "chunk-cache fetch failed" }
+
+      - name: Alias VS Community to Enterprise
+        # script/bundle-windows.ps1 launches VsDevShell from a hardcoded
+        # ...\2022\Community path. Locate the real VS installation with
+        # vswhere (image-independent) and junction it to the expected path,
+        # keeping the upstream script untouched (zero merge surface).
+        shell: pwsh
+        run: |
+          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+          $launch = "$vsRoot\Community\Common7\Tools\Launch-VsDevShell.ps1"
+          if (-not (Test-Path $launch)) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
+            $installPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath | Select-Object -First 1
+            if (-not $installPath) { throw "vswhere found no VS install with MSVC tools" }
+            Write-Host "vswhere installationPath: $installPath"
+            New-Item -ItemType Directory -Force -Path $vsRoot | Out-Null
+            if (Test-Path "$vsRoot\Community") {
+              Rename-Item "$vsRoot\Community" "Community.incomplete" -Force
+            }
+            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $installPath | Out-Null
+            Write-Host "Junctioned Community -> $installPath"
+          }
+          if (-not (Test-Path $launch)) { throw "Launch-VsDevShell.ps1 still missing after junction" }
+          Write-Host "Launch-VsDevShell.ps1 present"
+
+      - name: Ensure Inno Setup 6
+        # windows-latest images ship Inno Setup 6 at the path the bundle
+        # script expects; choco is only a fallback for future image changes.
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Configure sccache wrapper + canary
+        # RUSTC_WRAPPER is a cargo-level mechanism: a bare `rustc` call never
+        # consults it. The canary therefore builds a tiny cargo project (a
+        # staticlib, so no MSVC linker needed) and asserts the request
+        # counter actually moved, for the absolute wrapper path and against
+        # the real repo invocation. Fails in ~1 min instead of discovering
+        # a dead cache after 3 hours of compiling.
+        shell: pwsh
+        run: |
+          "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
+          "SCCACHE_ERROR_LOG=$env:RUNNER_TEMP\sccache-error.log" >> $env:GITHUB_ENV
+          # Multilevel cache: local disk store L0, GHA L2, auto-backfill on
+          # GHA hits. Inline (not GITHUB_ENV): the server starting below
+          # must be born with these. SCCACHE_ERROR_LOG must ALSO be inline:
+          # GITHUB_ENV only reaches later steps, and a server born without
+          # it logs nowhere (production runs silently produced no server
+          # log for weeks).
+          $env:SCCACHE_ERROR_LOG = "$env:RUNNER_TEMP\sccache-error.log"
+          $env:SCCACHE_MULTILEVEL_CHAIN = "disk,gha"
+          $env:SCCACHE_DIR = "$env:GITHUB_WORKSPACE\.sccache-disk"
+          $env:SCCACHE_CACHE_SIZE = "10G"
+          & $env:SCCACHE_PATH --stop-server 2>$null
+          & $env:SCCACHE_PATH --start-server
+          $dir = Join-Path $env:RUNNER_TEMP "wrapcanary"
+          New-Item -ItemType Directory -Force (Join-Path $dir "src") | Out-Null
+          Set-Content (Join-Path $dir "Cargo.toml") @'
+          [package]
+          name = "wrapcanary"
+          version = "0.0.0"
+          edition = "2021"
+
+          [lib]
+          crate-type = ["staticlib"]
+          '@
+          Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping() {}'
+          $manifest = Join-Path $dir "Cargo.toml"
+          function Get-Requests {
+            $s = (& $env:SCCACHE_PATH --show-stats) | Out-String
+            if ($s -match "Compile requests\s+(\d+)") { return [int]$Matches[1] }
+            return -1
+          }
+          $env:RUSTC_WRAPPER = $env:SCCACHE_PATH
+          cargo build --manifest-path $manifest 2>&1 | Select-Object -Last 2
+          $abs = Get-Requests
+          Write-Host "== requests after absolute-path canary: $abs"
+
+          # 2) pinned toolchain + --release + --target (real build flags)
+          Set-Content (Join-Path $dir "src\lib.rs") '#[no_mangle] pub extern "C" fn ping2() {}'
+          rustup run 1.98.1 cargo build --release --target x86_64-pc-windows-msvc --manifest-path $manifest 2>&1 | Select-Object -Last 2
+          $pinned = Get-Requests
+          Write-Host "== requests after pinned-toolchain canary: $pinned"
+          if ($pinned -le $abs) {
+            throw "sccache does not engage with the pinned 1.98.1 toolchain (requests $abs -> $pinned)."
+          }
+
+          # 3) the real invocation: repo root, bundle-config.toml, --release,
+          # --target, a first-party crate (also pre-banks its compiles)
+          $before = $pinned
+          Push-Location $env:GITHUB_WORKSPACE
+          rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1 2>&1 | Out-Null
+          cargo --config .cargo/bundle-config.toml check -p sqlez_macros --release --target x86_64-pc-windows-msvc 2>&1 | Select-Object -Last 2
+          Pop-Location
+          $real = Get-Requests
+          Write-Host "== requests after real-invocation canary: $real"
+          if ($real -le $before) {
+            throw "sccache does not engage for the real repo/config/target invocation (requests $before -> $real)."
+          }
+          Write-Host "sccache canary OK (absolute=$abs, pinned=$pinned, real=$real)"
+
+          # Cache native C/C++ builds too: -sys crates' build scripts
+          # invoke cl.exe directly, which RUSTC_WRAPPER never sees, so
+          # those ~242 crates rebuilt from scratch every run (~60min).
+          # cc-rs honors CC/CXX; sccache forwards to cl.exe. Requires the
+          # VsDevShell environment (INCLUDE/LIB), which both the prewarm
+          # pass and the bundle build provide.
+          $sccacheDir = Split-Path $env:SCCACHE_PATH
+          "PATH=$sccacheDir;$env:PATH" >> $env:GITHUB_ENV
+          "CC=sccache cl" >> $env:GITHUB_ENV
+          "CXX=sccache cl" >> $env:GITHUB_ENV
+
+          # C canary: prove sccache can cache cl.exe in ~1min, before
+          # burning an hour on a full build. Same file compiled twice -
+          # the second compile must be a cache hit.
+          & "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch x64 -HostArch x64
+          Set-Content (Join-Path $dir "ping.c") 'int ping3(void){return 3;}'
+          function Get-CHits {
+            $s = (& $env:SCCACHE_PATH --show-stats) | Out-String
+            if ($s -match "Cache hits \(C/C\+\+\)\s+(\d+)") { return [int]$Matches[1] }
+            return -1
+          }
+          $h0 = Get-CHits
+          Push-Location $dir
+          & $env:SCCACHE_PATH cl /nologo /c ping.c 2>&1 | Select-Object -Last 1
+          $h1 = Get-CHits
+          & $env:SCCACHE_PATH cl /nologo /c ping.c 2>&1 | Select-Object -Last 1
+          Pop-Location
+          $h2 = Get-CHits
+          Write-Host "== C canary: hits $h0 -> $h1 -> $h2"
+          if ($h2 -le $h1) {
+            & $env:SCCACHE_PATH --show-stats
+            throw "sccache cannot cache cl.exe output (C hits $h0 -> $h1 -> $h2). Native caching is broken."
+          }
+
+      - name: Prewarm sccache (pure pull pass)
+        # Pass 1 with the bundle script's exact command and env: on a warm
+        # store every unit is a sccache hit, so this phase is a pure
+        # 16-way concurrent pull of the whole store and compiles nothing;
+        # pass 2 (Bundle Windows) then finds everything fresh. The
+        # VsDevShell launch is REQUIRED for parity: cc-rs build-script
+        # fingerprints depend on the MSVC environment, and a bare shell
+        # makes pass 2 distrust every native product of pass 1.
+        # Optimization only - a failure here must not kill the build.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          "PREWARM_START=$(Get-Date -Format o)" >> $env:GITHUB_ENV
+          & "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch x64 -HostArch x64
+          $env:ZED_RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
+          $env:RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
+          rustup target add x86_64-pc-windows-msvc
+          cargo --config .cargo/bundle-config.toml build --timings --release --package zed --package cli --package auto_update_helper --target x86_64-pc-windows-msvc
+          Get-ChildItem target -Recurse -Filter cargo-timing.html |
+            ForEach-Object { Copy-Item $_.FullName ($_.FullName -replace 'cargo-timing\.html', 'cargo-timing-pass1.html') }
+          cargo --config .cargo/bundle-config.toml build --release --package explorer_command_injector --target x86_64-pc-windows-msvc
+
+      - name: Cache gate (fast fail)
+        # Live verdict: this step's conclusion and its failure annotation
+        # are visible via the API while the run continues - no need to
+        # wait for job logs (Windows logs appear only after completion).
+        # expect_warm_cache=false turns this into an advisory print for
+        # bank runs.
+        shell: pwsh
+        run: |
+          $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
+          Write-Host $stats
+          $stats | Add-Content $env:GITHUB_STEP_SUMMARY
+          $rustHit = 0.0; $cHit = 0.0; $cReq = 0
+          if ($stats -match "Cache hits rate \(Rust\)\s+([\d.]+) %") { $rustHit = [double]$Matches[1] }
+          if ($stats -match "(Compile|Cache) requests \(C/C\+\+\)\s+(\d+)") { $cReq = [int]$Matches[2] }
+          if ($stats -match "Cache hits rate \(C/C\+\+\)\s+([\d.]+) %") { $cHit = [double]$Matches[1] }
+          if ("${{ inputs.expect_warm_cache }}" -ne "true") {
+            Write-Host "bank run - gate advisory only (rust=$rustHit%, c=$cHit% of $cReq)"
+            exit 0
+          }
+          if ($env:PREWARM_START) {
+            $pullMin = [math]::Round(((Get-Date) - (Get-Date $env:PREWARM_START)).TotalMinutes, 1)
+            # 45min: first verification of the uncacheable-layer cache;
+            # tighten as the layer proves out.
+            if ($pullMin -gt 45) { throw "prewarm pull took ${pullMin}min (>45) - pull path too slow, see sccache server log artifact" }
+            Write-Host "prewarm wall: ${pullMin}min"
+          }
+          if ($rustHit -lt 60) { throw "Rust hit rate ${rustHit}% < 60% - cache not effective" }
+          if ($cReq -gt 50 -and $cHit -lt 50) { throw "C/C++ hit rate ${cHit}% < 50% over $cReq requests - native cache not effective" }
+          Write-Host "cache gate OK (rust=${rustHit}%, c=${cHit}% of $cReq)"
+
+      - name: Bundle Windows
+        shell: pwsh
+        run: script/bundle-windows.ps1 -Architecture ${{ inputs.architecture || 'x86_64' }}
+
+      - name: Upload cargo timings
+        # Must run AFTER the build: the timing html only exists once cargo
+        # finishes. (This step used to sit before the build and silently
+        # uploaded nothing.) Diagnostic-only: the target/** glob walk can
+        # trip EPERM stat'ing odd build dirs (e.g. webrtc-sys cxxbridge),
+        # which must never fail the run or skip the installer upload.
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings
+          path: target/**/cargo-timings/*.html
+          if-no-files-found: ignore
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-Windows-Installer-${{ inputs.architecture || 'x86_64' }}
+          path: |
+            target/Zed-*.exe
+            target/ZedEditorUserSetup-*.exe
+          if-no-files-found: error
+
+      - name: Push sccache chunks and merge chunk index
+        # Pack the local disk store (L0) into content-addressed chunks and
+        # push only the ones the GHA backend does not have yet (unchanged
+        # chunks dedupe by key, so an unchanged tree pushes near-zero
+        # bytes). The script also merges the restored index with the fresh
+        # chunk set, pruning chunk keys the fetch step found evicted.
+        # Runs AFTER the installer upload so a failure here loses only
+        # prefetch speed, never the product. always(): a cancelled run
+        # still banks what it got.
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\.sccache-disk")) { Write-Host "no disk store - skip"; exit 0 }
+          node fork-tools/chunk-cache.js push
+          if ($LASTEXITCODE -ne 0) { throw "chunk-cache push failed" }
+
+      - name: Save sccache chunk index
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .sccache-chunkindex
+          key: sccache-chunk-index-x86_64-${{ github.run_id }}
+
+      - name: Save uncacheable compiler layer
+        # Persist this run's layer as the newest entry for the next run's
+        # restore-keys. always(): a cancelled run still banked everything
+        # compiled before cancellation.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            target/release/build
+            target/release/deps/*.dll
+            target/release/deps/*.exe
+            target/release/.fingerprint
+            target/x86_64-pc-windows-msvc/release/build
+            target/x86_64-pc-windows-msvc/release/.fingerprint
+          key: uncacheable-layer-x86_64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+
+      - name: Show sccache stats
+        if: always()
+        shell: pwsh
+        run: |
+          & $env:SCCACHE_PATH --show-stats
+
+      - name: Upload sccache error log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-error-log
+          path: ${{ runner.temp }}/sccache-error.log
+          if-no-files-found: ignore

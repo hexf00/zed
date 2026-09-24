@@ -1,0 +1,234 @@
+# Fork-only probe: answer "why do first-party crates miss sccache every
+# run" in minutes instead of hours. Builds a tiny first-party crate three
+# times (touch between builds forces rustc re-invocation with identical
+# content), then asserts every pass-2/3 unit is a sccache hit. A miss
+# means the sccache key drifts despite identical inputs; the -v rustc
+# command lines (uploaded as artifacts) contain the differing token.
+#
+# Dispatch once for in-run drift, twice (same commit) for cross-run drift.
+name: Fork Cache Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: First-party crate to probe
+        type: choice
+        default: release_channel
+        options:
+          - release_channel
+          - sqlez_macros
+          - assets
+      runs:
+        description: Number of build passes
+        type: choice
+        default: "3"
+        options:
+          - "2"
+          - "3"
+      link_args:
+        description: MSVC LINK env value for every link.exe (experiments only)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-cache-probe-${{ inputs.crate }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_IDLE_TIMEOUT: "7200"
+      CARGO_BUILD_JOBS: "16"
+      SCCACHE_LOG: "debug"
+      # Match production: at debug=0 the PE has no debug directory/PDB GUID,
+      # isolating PE-timestamp variance from debug-info variance.
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      # Job-level so the sccache server inherits it no matter which process
+      # auto-starts it (client-started servers used to lose the inline env
+      # set in the Configure step, and with it the request log).
+      SCCACHE_ERROR_LOG: "D:\\a\\_temp\\sccache-server.log"
+      # Fork sccache: dump every key-input component for drift debugging.
+      SCCACHE_FORK_DUMP_DIR: "D:\\a\\_temp\\keydump"
+      # link.exe reads the LINK env var and prepends it to its options for
+      # EVERY invocation (host artifacts included). With --target, cargo on
+      # stable gives host artifacts (proc-macros/build scripts) NO rustflags
+      # at all, so linker options cannot reach their links through rustflags
+      # — the env var is the only channel. /Brepro is unusable here: its
+      # output hash covers rustc's per-invocation random temp paths, so the
+      # dll still varies. /TIMESTAMP:<fixed> pins the PE timestamp fields
+      # directly without input hashing.
+      LINK: ${{ inputs.link_args }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-windows-
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Restore fork sccache
+        uses: actions/cache@v4
+        id: fork-sccache
+        with:
+          path: ${{ runner.temp }}/sccache-fork
+          key: sccache-fork-0.18.0-fork.1-${{ hashFiles('fork-tools/*.patch') }}
+
+      - name: Install fork sccache
+        # Overwrite the action-downloaded binary before the server starts.
+        # The fork zeroes link-time-volatile PE bytes (COFF/debug/export
+        # timestamps, RSDS GUID + PDB age, REPRO hashes) when hashing
+        # --extern files, so downstream first-party keys stay stable across
+        # builds even though proc-macro dlls are re-linked every run.
+        shell: pwsh
+        run: |
+          $bin = Join-Path $env:RUNNER_TEMP "sccache-fork\sccache.exe"
+          if (-not (Test-Path $bin)) {
+            throw "fork sccache binary not in GHA cache - dispatch 'Fork sccache build' once, then rerun"
+          }
+          Write-Host "restored version: $(cmd /c "`"$bin`" --version" 2>&1)"
+          $srcHash = (Get-FileHash $bin -Algorithm SHA256).Hash
+          Write-Host "restored hash: $srcHash"
+          # SCCACHE_PATH itself is extensionless ("...\x64/sccache"), and
+          # Windows appends .exe when CreateProcess/cmd resolve it — so the
+          # binary that actually runs is "<SCCACHE_PATH>.exe". Overwrite THAT
+          # file, not the extensionless one.
+          $dst = ($env:SCCACHE_PATH -replace '/', '\') + '.exe'
+          Write-Host "destination: $dst"
+          if (-not (Test-Path $dst)) { throw "action sccache.exe not found at $dst" }
+          Copy-Item -LiteralPath $bin -Destination $dst -Force
+          $dstHash = (Get-FileHash $dst -Algorithm SHA256).Hash
+          Write-Host "destination hash: $dstHash"
+          if ($dstHash -ne $srcHash) { throw "fork sccache copy failed (hash mismatch)" }
+          $v = & $dst --version
+          Write-Host "active sccache: $v"
+          if ("$v" -notlike "*0.18.0-fork.1*") { throw "sccache version mismatch: '$v'" }
+
+      - name: Alias VS Community to Enterprise
+        shell: pwsh
+        run: |
+          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+          $launch = "$vsRoot\Community\Common7\Tools\Launch-VsDevShell.ps1"
+          if (-not (Test-Path $launch)) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $installPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath | Select-Object -First 1
+            New-Item -ItemType Directory -Force -Path $vsRoot | Out-Null
+            if (Test-Path "$vsRoot\Community") {
+              Rename-Item "$vsRoot\Community" "Community.incomplete" -Force
+            }
+            New-Item -ItemType Junction -Path "$vsRoot\Community" -Target $installPath | Out-Null
+          }
+          Write-Host "VS junction ready"
+
+      - name: Configure sccache + env
+        shell: pwsh
+        run: |
+          "RUSTC_WRAPPER=$env:SCCACHE_PATH" >> $env:GITHUB_ENV
+          $sccacheDir = Split-Path $env:SCCACHE_PATH
+          "PATH=$sccacheDir;$env:PATH" >> $env:GITHUB_ENV
+          "CC=sccache cl" >> $env:GITHUB_ENV
+          "CXX=sccache cl" >> $env:GITHUB_ENV
+          # Inline (not GITHUB_ENV): the server must be started with these
+          # already in its environment - GITHUB_ENV only affects later
+          # steps, and the server lives across steps.
+          $env:SCCACHE_ERROR_LOG = "D:\a\_temp\sccache-server.log"
+          $env:SCCACHE_LOG = "debug"
+          & $env:SCCACHE_PATH --stop-server 2>$null
+          & $env:SCCACHE_PATH --start-server
+
+      - name: Probe builds
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          & "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch x64 -HostArch x64
+          # VsDevShell may change cwd; anchor everything to the workspace.
+          Set-Location $ws
+          $env:ZED_RELEASE_CHANNEL = Get-Content (Join-Path $ws "crates/zed/RELEASE_CHANNEL")
+          $env:RELEASE_CHANNEL = Get-Content crates/zed/RELEASE_CHANNEL
+          rustup target add x86_64-pc-windows-msvc 2>&1 | Out-Null
+          $crate = "${{ inputs.crate }}"
+          $passes = [int]("${{ inputs.runs }}")
+          function Get-DllFingerprint {
+            # proc-macros are HOST artifacts: with --target they land in
+            # target/release/deps (no triple), NOT the triple dir.
+            $d = "target/release/deps"
+            Get-ChildItem $d -Filter *.dll -ErrorAction SilentlyContinue | Sort-Object Name |
+              ForEach-Object { "{0}={1}" -f $_.Name, (Get-FileHash $_.FullName -Algorithm SHA256).Hash }
+            $pm = Get-ChildItem $d -Filter "*gpui_macros*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($pm) {
+              "PROBE {0} sha={1} mtime={2} size={3}" -f $pm.Name, (Get-FileHash $pm.FullName -Algorithm SHA256).Hash, $pm.LastWriteTimeUtc.ToString("o"), $pm.Length
+            } else { "PROBE gpui_macros dll NOT FOUND in $d" }
+          }
+          for ($i = 1; $i -le $passes; $i++) {
+            if ($i -gt 1) {
+              # same content, new mtime: forces cargo to re-invoke rustc
+              (Get-Content (Join-Path $ws "crates/$crate/src/lib.rs") -Raw) |
+                Set-Content (Join-Path $ws "crates/$crate/src/lib.rs") -NoNewline
+              (Get-Content (Join-Path $ws "crates/gpui_macros/src/gpui_macros.rs") -Raw) |
+                Set-Content (Join-Path $ws "crates/gpui_macros/src/gpui_macros.rs") -NoNewline
+            }
+            $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
+            $h0 = 0; $r0 = 0
+            if ($stats -match "Cache hits \(Rust\)\s+(\d+)") { $h0 = [int]$Matches[1] }
+            if ($stats -match "Compile requests\s+(\d+)") { $r0 = [int]$Matches[1] }
+            Write-Host "===== PASS $i (before: requests=$r0 rustHits=$h0) ====="
+            cargo --config .cargo/bundle-config.toml build -v --release --package $crate --target x86_64-pc-windows-msvc 2>&1 |
+              Tee-Object -FilePath (Join-Path $ws "probe-pass$i.log") | Select-Object -Last 3
+            Get-DllFingerprint | Set-Content (Join-Path $ws "dll-hash-pass$i.txt")
+            $pm = Get-ChildItem "target/release/deps" -Filter "*gpui_macros*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($pm) { Copy-Item $pm.FullName (Join-Path $ws "dll-pass$i.bin") -Force }
+            $stats = (& $env:SCCACHE_PATH --show-stats) | Out-String
+            $h1 = 0; $r1 = 0; $m1 = 0
+            if ($stats -match "Cache hits \(Rust\)\s+(\d+)") { $h1 = [int]$Matches[1] }
+            if ($stats -match "Compile requests\s+(\d+)") { $r1 = [int]$Matches[1] }
+            if ($stats -match "Cache misses\s+(\d+)") { $m1 = [int]$Matches[1] }
+            $units = $r1 - $r0
+            $hits = $h1 - $h0
+            Write-Host "===== PASS $i result: units=$units hits=$hits misses=$($units-$hits) ====="
+            "pass${i}: units=$units hits=$hits" | Add-Content (Join-Path $ws "probe-summary.txt")
+          }
+          # The flag now rides into link.exe via the LINK env var (not the
+          # rustc argv), so the verdict is purely the dll hash stability
+          # across passes: same bytes pass-to-pass == downstream keys stable.
+          Write-Host "===== LINK env in build step = $env:LINK ====="
+          "link_env=$env:LINK" | Add-Content (Join-Path $ws "probe-summary.txt")
+          Write-Host "=== serverlog diag ==="
+          Write-Host "exists: $(Test-Path 'D:\a\_temp\sccache-server.log')"
+          Get-ChildItem 'D:\a\_temp' -Filter '*sccache*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "$($_.Name) $($_.Length)" }
+          Copy-Item 'D:\a\_temp\sccache-server.log' (Join-Path $ws 'sccache-server.log') -Force -ErrorAction Continue
+          if (Test-Path 'D:\a\_temp\keydump') {
+            Copy-Item 'D:\a\_temp\keydump' (Join-Path $ws 'keydump') -Recurse -Force -ErrorAction Continue
+          }
+
+      - name: Upload probe logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-probe-${{ inputs.crate }}
+          path: |
+            probe-pass*.log
+            probe-summary.txt
+            sccache-server.log
+            dll-hash-pass*.txt
+            dll-pass*.bin
+            keydump/**
+          if-no-files-found: warn

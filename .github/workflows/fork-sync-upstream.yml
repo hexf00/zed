@@ -1,0 +1,86 @@
+# Fork-only workflow: keep the fork as ONE commit on top of upstream/main.
+#
+# Branch model (docs/fork-maintenance.md):
+#   upstream/main = zed-industries/zed (never touched, no PRs upstream)
+#   main = custom  = upstream/main + ONE squash commit ("fork: ...")
+#   All fork work is committed on custom; this workflow replays that single
+#   commit onto the new upstream main (rebase) and force-pushes both
+#   branches. Conflicts can only come from the handful of upstream files
+#   the fork modifies (bundle script, bundle-config, settings) - resolve
+#   locally, then re-run this workflow.
+name: Fork Upstream Sync
+
+on:
+  schedule:
+    # Mondays 01:30 UTC = 09:30 Beijing
+    - cron: "30 1 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: custom
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch upstream main
+
+      - name: Replay the fork commit onto upstream/main
+        id: rebase
+        run: |
+          BEFORE=$(git rev-parse HEAD)
+          echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
+          if git rebase upstream/main; then
+            AFTER=$(git rev-parse HEAD)
+            echo "after=$AFTER" >> "$GITHUB_OUTPUT"
+            if [ "$BEFORE" = "$AFTER" ]; then
+              echo "already on latest upstream main - nothing to do"
+            fi
+          else
+            git rebase --abort
+            exit 1
+          fi
+
+      - name: Force-push main and custom
+        if: steps.rebase.outcome == 'success'
+        run: |
+          # Both branches are the same single fork commit; main exists so the
+          # default branch always carries the fork workflows for schedules.
+          git push --force-with-lease origin custom
+          git push --force-with-lease origin custom:main
+
+      - name: Open issue on rebase conflict
+        if: steps.rebase.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_BODY: "Weekly rebase of the fork commit onto upstream/main hit conflicts (expected only in: script/bundle-windows.ps1, .cargo/bundle-config.toml, assets/settings/initial_user_settings.json, .gitignore). Run locally: git checkout custom && git fetch origin && git fetch upstream && git rebase upstream/main. Resolve keeping upstream structure + fork additions, then: git push --force-with-lease origin custom && git push --force-with-lease origin custom:main"
+        run: |
+          git rebase --abort 2>/dev/null || true
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Upstream sync needs a manual rebase ($(date -u +%F))" \
+            --body "$ISSUE_BODY"
+        # No automatic build dispatch: builds are manual-only (hours long).
+        # Note GHA cache entries unused for 7 days get evicted - if you sync
+        # but never build, the next build falls back toward cold times.
+        # Trigger: gh workflow run fork-build-windows.yml --ref custom

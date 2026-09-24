@@ -14,4 +14,18 @@
     "light": "One Light",
     "dark": "One Dark",
   },
+
+  // ---- fork defaults (docs/fork-maintenance.md diff inventory CFG-1) ----
+  // iteration test 2: steady-state verification (deps must all hit)
+  // Never let official Zed auto-update overwrite this fork build.
+  "auto_update": false,
+  // No crash/usage reporting.
+  "telemetry": {
+    "diagnostics": false,
+    "metrics": false,
+  },
+  // Don't auto-download extensions (upstream auto-installs "html").
+  "auto_install_extensions": {
+    "html": false,
+  },
 }
